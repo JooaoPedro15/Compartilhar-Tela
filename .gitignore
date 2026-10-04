@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.env
+*.log
+.DS_Store
+.cache/
+site/
+coverage/
+
+# O zip de deploy, montado a partir da propria pasta. Nao e fonte de nada.
+*.zip
