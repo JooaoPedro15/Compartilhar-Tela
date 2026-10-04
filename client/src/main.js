@@ -3,6 +3,7 @@ import { createPlayer } from './player.js';
 import { createAudio } from './audio.js';
 import { destinoDaQueda } from './reconexao.js';
 import { createArmazenamento } from './armazenamento.js';
+import { createAvisos } from './avisos.js';
 import { createBroadcaster } from '../../shared/broadcaster.js';
 import {
   iceServers,
@@ -24,6 +25,7 @@ const inDiscord = params.has('frame_id');
 const P = inDiscord ? '/.proxy' : '';
 
 const { read, store, remove } = createArmazenamento();
+const { toast, setEmpty } = createAvisos({ porId: $ });
 
 // Um decoder e um canvas por transmissor, indexados pelo slot que o servidor
 // atribuiu. Os canvas vivem fora do DOM entre renderizações e são movidos para
@@ -108,21 +110,6 @@ let telaCheia = false;
 let chegada = null;
 
 // ------------------------------------------------------------------- helpers
-
-let toastTimer = null;
-function toast(msg, isError = false) {
-  const el = $('toast');
-  el.textContent = msg;
-  el.classList.toggle('error', isError);
-  el.hidden = false;
-  clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => (el.hidden = true), 6000);
-}
-
-function setEmpty(title, text) {
-  $('emptyTitle').textContent = title;
-  $('emptyText').textContent = text;
-}
 
 /** Cor estável por usuário — mesma pessoa, mesma cor, em qualquer sessão. */
 function colorFor(id) {
