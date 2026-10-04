@@ -10,6 +10,32 @@ compartilha por link.
 
 ---
 
+## Sobre esta versão
+
+Este repositório continua o [Sala de Tela original](#créditos), com o foco em
+deixar o programa mais confiável e o código mais fácil de manter e estudar.
+
+**Já corrigido aqui:**
+
+- **"Ver minha tela" carregando para sempre.** Um erro no decodificador de
+  vídeo deixava a tela em "Conectando…" sem aviso nenhum. Agora ele se recupera
+  sozinho e, quando não dá, mostra o motivo no lugar do carregamento.
+- **Queda do servidor expulsava da sala.** Se o servidor reinicia, a sala mostra
+  "Reconectando…" e volta sozinha, em vez de dizer que a sessão expirou.
+- **Login pelo site mais seguro.** O login do Discord agora fica amarrado ao
+  navegador que o começou (proteção contra *login CSRF*).
+- **Discord lento não trava mais a atividade.** Toda chamada do servidor ao
+  Discord tem prazo.
+- **Salas:** Enter cria a sala e salva a senha, e o clique duplo não cria mais
+  duas salas iguais.
+- **Configuração:** o erro 50226 do Discord virou uma instrução clara (ligar
+  "Enable Activities" no portal).
+
+**Em andamento:** o código do site está sendo dividido em módulos menores, com
+testes automatizados para cada um, e o visual está sendo polido.
+
+---
+
 ## O que você precisa antes
 
 **1. Node.js** — é o programa que faz tudo isso rodar.
@@ -27,7 +53,12 @@ Para *assistir*, qualquer navegador serve.
 
 ## Ligar tudo (um comando)
 
-**1.** Baixe este projeto e descompacte numa pasta.
+**1.** Baixe este projeto e descompacte numa pasta — pelo botão **Code → Download
+ZIP** no GitHub, ou, se você usa git:
+
+```
+git clone https://github.com/JooaoPedro15/Compartilhar-Tela.git
+```
 
 **2.** Abra a pasta, clique na barra de endereço do explorador de arquivos,
 digite `cmd` e aperte Enter. Vai abrir uma janela preta — é ali que você digita
@@ -65,6 +96,9 @@ O Discord exige que você registre o programa no site dele. É uma vez só.
 Quando o `npm run start:fast` pedir, ele vai te dizer exatamente onde achar cada
 valor no site do Discord, e no fim mostra **as coisas para colar lá**, já
 preenchidas com os seus dados. Faça o que ele mandar.
+
+> Não esqueça de ligar **Activities → Settings → Enable Activities** no site do
+> Discord (e salvar). Sem isso a atividade não aparece no foguete.
 
 Depois, no Discord: entre num canal de voz, clique no **foguete** 🚀 na barra de
 baixo e escolha a atividade.
@@ -147,9 +181,9 @@ caixinha de áudio: a transmissão vai **sem som**.
 
 ### Quero mostrar a tela inteira E ter som
 
-Dá. Clique na engrenagem e escolha **"Som de uma aba ou janela"**. O vídeo continua
-sendo a tela inteira, e o som passa a vir da aba que você escolher — que é a
-única fonte que não carrega o Discord junto.
+Dá. Na página de captura, clique em **"Som de uma aba ou janela"**. O vídeo
+continua sendo a tela inteira, e o som passa a vir da aba que você escolher — que
+é a única fonte que não carrega o Discord junto.
 
 Serve para YouTube, Twitch, jogo de navegador. Para um jogo instalado, cujo som
 não está em aba nenhuma, não tem como — nem aqui nem em qualquer outro site.
@@ -179,10 +213,19 @@ Discord normalmente, só não feche a aba.
 O Node.js não foi instalado, ou a janela preta foi aberta antes da instalação.
 Feche a janela, abra de novo e tente outra vez.
 
+**A atividade não aparece no foguete do Discord**
+Confira no site do Discord se **Activities → Settings → Enable Activities** está
+ligado (recarregue a página para ter certeza de que salvou). Se o `npm run dev`
+mostrar o aviso sobre "Enable Activities", é exatamente isso.
+
+**A tela fica em "Conectando…" ou aparece uma mensagem no lugar dela**
+A mensagem diz o motivo — por exemplo, o aplicativo não conseguir decodificar o
+vídeo daquela transmissão. Nesse caso, assista pelo navegador.
+
 **Não sai som**
-Abra o botão ⓘ na barra de baixo e olhe a linha **Som**. Ela diz em qual dos
-casos você está: sem áudio na transmissão, esperando o áudio, silenciado aí, ou
-tocando.
+Aperte **Ctrl + Shift + D** para abrir o diagnóstico e olhe a linha **Som**. Ela
+diz em qual dos casos você está: sem áudio na transmissão, esperando o áudio,
+silenciado aí, ou tocando.
 
 **Quero mudar alguma configuração**
 Rode `npm run configurar`. Ele lembra do que você já respondeu — é só apertar
@@ -229,6 +272,9 @@ Para quem mexe no código:
 | `npm run dev:rapido` | O mesmo, mas com endereço descartável e sem tocar no `.env`. |
 | `npm start` | Monta o site e sobe só o servidor, sem túnel. |
 | `npm run tunel` | Só o túnel, numa janela separada. |
+| `npm test` | Roda todos os testes automatizados. |
+| `npm run lint` | Procura erros no código (variável não declarada, import esquecido…). |
+| `npm run coverage` | Testes com a medida de quanto do código eles cobrem. |
 
 ---
 
