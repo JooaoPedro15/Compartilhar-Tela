@@ -2416,7 +2416,18 @@ $('createModal').addEventListener('click', (e) => {
   if (e.target === $('createModal')) $('createModal').hidden = true;
 });
 
+// Enter cria, como no pedido de senha: o modal já é um formulário de um passo.
+for (const id of ['createName', 'createPass']) {
+  $(id).addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') $('createGo').click();
+  });
+}
+
 $('createGo').addEventListener('click', async () => {
+  // Um pedido por vez: o clique duplo criava duas salas, porque o segundo
+  // saía antes de o primeiro voltar e fechar o modal.
+  if ($('createGo').disabled) return;
+  $('createGo').disabled = true;
   const name = $('createName').value.trim();
 
   try {
@@ -2434,6 +2445,8 @@ $('createGo').addEventListener('click', async () => {
     });
   } catch (err) {
     toast(err.message, true);
+  } finally {
+    $('createGo').disabled = false;
   }
 });
 
@@ -2457,7 +2470,14 @@ $('roomModal').addEventListener('click', (e) => {
   if (e.target === $('roomModal')) $('roomModal').hidden = true;
 });
 
+$('roomPass').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') $('roomSave').click();
+});
+
 $('roomSave').addEventListener('click', async () => {
+  // A sala pode ter fechado com o modal aberto; sem ela não há o que salvar.
+  if ($('roomSave').disabled || !roomTokens) return;
+  $('roomSave').disabled = true;
   try {
     const r = await post(`${P}/api/rooms/password`, {
       identity: session.identity,
@@ -2468,6 +2488,8 @@ $('roomSave').addEventListener('click', async () => {
     toast(r.locked ? 'Sala protegida com senha.' : 'Senha removida.');
   } catch (err) {
     toast(err.message, true);
+  } finally {
+    $('roomSave').disabled = false;
   }
 });
 
