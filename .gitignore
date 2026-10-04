@@ -9,3 +9,6 @@ coverage/
 
 # O zip de deploy, montado a partir da propria pasta. Nao e fonte de nada.
 *.zip
+
+# Configuração local de ferramentas (preview do Claude Code).
+.claude/

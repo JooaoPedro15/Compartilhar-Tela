@@ -246,3 +246,12 @@ Para quem mexe no código:
 
 Se você mexe em código e quer entender as decisões por trás disso,
 veja [docs/como-funciona.md](docs/como-funciona.md).
+
+---
+
+## Créditos
+
+Este projeto parte do [discord-screen](https://github.com/Jc007zZ/discord-screen),
+de **Jc007zZ**, que escreveu o Sala de Tela original. O primeiro commit deste
+repositório é o código dele como estava; tudo o que vem depois são correções e
+mudanças feitas aqui.
