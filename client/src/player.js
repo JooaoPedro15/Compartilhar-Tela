@@ -56,10 +56,24 @@ const AJUSTE_MS = 2000;
 /** Correção máxima por ajuste: acima disso a mudança de ritmo se vê. */
 const PASSO_MAX_MS = 15;
 
+/**
+ * Erros seguidos, sem nenhum quadro no meio, antes de desistir.
+ *
+ * Um erro isolado é fluxo fora de sincronia e se resolve com um decoder novo no
+ * keyframe seguinte. Erro atrás de erro é o decoder recusando aquele fluxo, e
+ * insistir só troca o silêncio por um laço.
+ */
+const FALHAS_MAX = 3;
+
 export function createPlayer(canvas, { onError, onTamanho } = {}) {
   const ctx = canvas.getContext('2d', { alpha: false, desynchronized: true });
 
   let decoder = null;
+  // A config já desserializada: é dela que se monta um decoder novo depois de
+  // um erro, sem esperar quem transmite mandar a config de novo.
+  let config = null;
+  let falhasSeguidas = 0;
+  let desistiu = false;
   let needKeyframe = true;
   let lastLagMs = 0;
   let framesDrawn = 0;
@@ -93,39 +107,84 @@ export function createPlayer(canvas, { onError, onTamanho } = {}) {
       return false;
     }
 
-    const config = deserialize(rawConfig);
-
-    decoder = new VideoDecoder({
-      output: draw,
-      error: (err) => {
-        // Erro de decodificação normalmente é fluxo fora de sincronia:
-        // pedir um keyframe recupera sem derrubar a sessão.
-        console.warn('[decoder]', err.message);
-        needKeyframe = true;
-      },
-    });
+    config = deserialize(rawConfig);
 
     try {
-      decoder.configure(config);
+      montarDecoder();
     } catch {
       onError?.(`Codec não suportado por este navegador: ${config.codec}`);
       decoder = null;
+      config = null;
       return false;
     }
 
-    needKeyframe = true;
     return true;
+  }
+
+  /**
+   * Um decoder novo, a partir da config guardada.
+   *
+   * Existe à parte porque o erro não tem conserto no decoder que errou: pela
+   * especificação do WebCodecs, quando o callback de erro roda ele já está
+   * fechado, e fechado não decodifica mais nada. Antes o erro só pedia um
+   * keyframe — que chegava e era descartado pelo decoder morto, para sempre. Era
+   * o "Conectando…" eterno, sem nenhum aviso na tela.
+   */
+  function montarDecoder() {
+    const este = new VideoDecoder({
+      output: (frame) => {
+        falhasSeguidas = 0;
+        draw(frame);
+      },
+      error: (err) => {
+        // Erro de um decoder que já foi trocado não diz nada sobre o atual.
+        if (decoder !== este) return;
+        console.warn('[decoder]', err.name, err.message);
+        needKeyframe = true;
+        falhasSeguidas++;
+
+        // Codec que o navegador não tem não vai passar a ter no próximo
+        // keyframe; erro atrás de erro é a mesma recusa com outro nome.
+        if (err.name === 'NotSupportedError' || falhasSeguidas >= FALHAS_MAX) desistir(err);
+      },
+    });
+    decoder = este;
+    decoder.configure(config);
+    needKeyframe = true;
+  }
+
+  /** Para de tentar e diz por quê: um aviso só, até a próxima config. */
+  function desistir(err) {
+    desistiu = true;
+    decoder = null;
+    onError?.(
+      err.name === 'NotSupportedError'
+        ? `Este aplicativo não consegue decodificar o vídeo (${config.codec}). Tente assistir pelo navegador.`
+        : `O vídeo não pôde ser decodificado (${config.codec}): ${err.message}`,
+    );
   }
 
   /** Quadro empacotado: [1B slot][1B tipo][8B timestamp][8B envio][payload] */
   function push(buffer) {
-    if (!decoder || decoder.state !== 'configured') return;
+    if (!config || desistiu) return;
 
     const view = new DataView(buffer);
     const isKeyframe = view.getUint8(1) === 1;
 
     // Decoder frio só aceita keyframe; deltas antes disso viram erro.
     if (needKeyframe && !isKeyframe) return;
+
+    // O anterior morreu num erro. Só um keyframe serve de ponto de partida para
+    // o novo, e é por isso que a troca acontece aqui e não no próprio erro.
+    if (!decoder || decoder.state === 'closed') {
+      try {
+        montarDecoder();
+      } catch (err) {
+        desistir(err);
+        return;
+      }
+    }
+    if (decoder.state !== 'configured') return;
 
     const timestamp = view.getFloat64(2);
     const sentAt = view.getFloat64(10);
@@ -139,7 +198,9 @@ export function createPlayer(canvas, { onError, onTamanho } = {}) {
           data: new Uint8Array(buffer, 18),
         }),
       );
-      needKeyframe = false;
+      // Pelo estado, e não `false` direto: se o erro veio dentro do próprio
+      // decode, o decoder já fechou e o próximo ainda precisa de keyframe.
+      needKeyframe = decoder?.state !== 'configured';
     } catch (err) {
       console.warn('[decode]', err.message);
       needKeyframe = true;
@@ -287,12 +348,19 @@ export function createPlayer(canvas, { onError, onTamanho } = {}) {
       }
     }
     decoder = null;
+    config = null;
+    falhasSeguidas = 0;
+    desistiu = false;
     needKeyframe = true;
     lastLagMs = 0;
     esvaziar();
     base = null;
     ultimoTs = -Infinity;
     irregularidade = null;
+    // Recomeçar é voltar a esperar o primeiro quadro. Sem isto, o aviso dele
+    // não se repetia: quando a conexão direta caía e o relay voltava, o
+    // "Conectando…" ficava por cima de um vídeo que já estava tocando.
+    virgem = true;
     if (canvas.width && canvas.height) {
       ctx.fillStyle = '#000';
       ctx.fillRect(0, 0, canvas.width, canvas.height);

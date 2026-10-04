@@ -204,6 +204,113 @@ describe('ritmo de exibição', () => {
   });
 });
 
+/**
+ * Decodificador de mentira que segue o WebCodecs no erro: quando o callback de
+ * erro roda, o decoder já está fechado e não volta mais. `falhar` decide, por
+ * instância, se aquele decoder quebra no primeiro quadro.
+ */
+function decoderQueQuebra(falhar, nome = 'EncodingError') {
+  const criados = [];
+  globalThis.VideoDecoder = class {
+    constructor({ output, error }) {
+      this.output = output;
+      this.error = error;
+      this.state = 'unconfigured';
+      this.indice = criados.length;
+      criados.push(this);
+    }
+    configure() {
+      this.state = 'configured';
+    }
+    decode(chunk) {
+      if (falhar(this.indice)) {
+        this.state = 'closed';
+        this.error(new DOMException('falhou', nome));
+        return;
+      }
+      this.output({
+        timestamp: chunk.timestamp,
+        displayWidth: 1280,
+        displayHeight: 720,
+        close: vi.fn(),
+      });
+    }
+    close() {
+      this.state = 'closed';
+    }
+  };
+  globalThis.window = { VideoDecoder: globalThis.VideoDecoder };
+  return criados;
+}
+
+describe('recuperação do decodificador', () => {
+  it('monta outro decoder depois de um erro e volta a desenhar no keyframe seguinte', () => {
+    // Só o primeiro decoder quebra: o segundo, montado na recuperação, funciona.
+    const criados = decoderQueQuebra((i) => i === 0);
+    const p = player();
+
+    p.push(pacote(KEYFRAME, 0));
+    avancar(BUFFER_MS + 32);
+    expect(desenhados).toEqual([]);
+
+    // Delta não serve de ponto de partida: o decoder novo só nasce no keyframe.
+    p.push(pacote(DELTA, 33));
+    p.push(pacote(KEYFRAME, 66));
+    avancar(BUFFER_MS + 32);
+
+    expect(criados).toHaveLength(2);
+    expect(desenhados).toEqual([66]);
+  });
+
+  it('avisa e desiste quando o codec não é suportado, em vez de girar para sempre', () => {
+    const criados = decoderQueQuebra(() => true, 'NotSupportedError');
+    const onError = vi.fn();
+    const p = createPlayer(canvasFalso(), { onError });
+    p.start({ codec: 'avc1.64001e', codedWidth: 1280, codedHeight: 720 });
+
+    p.push(pacote(KEYFRAME, 0));
+    p.push(pacote(KEYFRAME, 33));
+    p.push(pacote(KEYFRAME, 66));
+
+    // Um aviso só, nomeando o codec, e nenhuma tentativa a mais: insistir num
+    // codec que o navegador não tem é trocar o silêncio por um laço.
+    expect(onError).toHaveBeenCalledTimes(1);
+    expect(onError.mock.calls[0][0]).toContain('avc1.64001e');
+    expect(criados).toHaveLength(1);
+  });
+
+  it('desiste depois de erros seguidos, mesmo que o codec exista', () => {
+    const criados = decoderQueQuebra(() => true);
+    const onError = vi.fn();
+    const p = createPlayer(canvasFalso(), { onError });
+    p.start({ codec: 'vp8', codedWidth: 1280, codedHeight: 720 });
+
+    for (let i = 0; i < 10; i++) p.push(pacote(KEYFRAME, i * 33));
+
+    expect(onError).toHaveBeenCalledTimes(1);
+    expect(criados.length).toBeLessThan(10);
+  });
+
+  it('avisa o primeiro quadro de novo depois de reiniciar', () => {
+    // É esse aviso que tira o "Conectando…" da tela. Reiniciar acontece quando
+    // a conexão direta cai e o relay volta: se o aviso não se repetir, o
+    // spinner fica por cima de um vídeo que está tocando.
+    const onTamanho = vi.fn();
+    const p = createPlayer(canvasFalso(), { onTamanho });
+    const config = { codec: 'vp8', codedWidth: 1280, codedHeight: 720 };
+
+    p.start(config);
+    p.push(pacote(KEYFRAME, 0));
+    avancar(BUFFER_MS + 32);
+    expect(onTamanho).toHaveBeenCalledTimes(1);
+
+    p.start(config);
+    p.push(pacote(KEYFRAME, 0));
+    avancar(BUFFER_MS + 32);
+    expect(onTamanho).toHaveBeenCalledTimes(2);
+  });
+});
+
 describe('irregularidade', () => {
   it('começa sem medida, porque ainda não houve janela', () => {
     expect(player().getJitter()).toBeNull();

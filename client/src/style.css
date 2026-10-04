@@ -352,6 +352,14 @@ body {
   pointer-events: none;
 }
 
+/* O player desistiu: o motivo no lugar do spinner, legível e sem girar. */
+.tile-loading.falha {
+  padding: 0 24px;
+  color: var(--text);
+  text-align: center;
+  line-height: 1.5;
+}
+
 .spinner {
   width: 26px;
   height: 26px;

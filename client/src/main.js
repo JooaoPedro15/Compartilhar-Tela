@@ -516,7 +516,7 @@ function buildTile(p, { palco = false, semVideo = false, slot: slotDado = null }
 
     // Entre pedir para assistir e o primeiro quadro chegar existe uma espera
     // real: sem este aviso ela é indistinguível de um travamento.
-    if (!stream.started) tile.append(buildLoading());
+    if (!stream.started) tile.append(stream.falha ? buildFalha(stream.falha) : buildLoading());
 
     // O clique direito pode ser capturado pelo cliente do Discord antes de
     // chegar aqui, então o botão visível é o caminho garantido.
@@ -571,6 +571,15 @@ function buildLoading() {
   wrap.className = 'tile-loading';
   wrap.innerHTML = '<span class="spinner"></span>';
   wrap.append(document.createTextNode('Conectando…'));
+  return wrap;
+}
+
+/** O player desistiu: no lugar do spinner, o motivo. */
+function buildFalha(motivo) {
+  const wrap = document.createElement('div');
+  wrap.className = 'tile-loading falha';
+  // textContent: a mensagem pode carregar texto vindo do navegador.
+  wrap.textContent = motivo;
   return wrap;
 }
 
@@ -934,8 +943,15 @@ function openStream(slot, userId) {
     // Vira true no primeiro quadro desenhado. Até lá o tile mostra "Conectando…"
     // em vez de uma caixa preta que não se distingue de um travamento.
     started: false,
+    // Motivo de o player ter desistido. Enquanto existe, o tile mostra isto no
+    // lugar do "Conectando…" — um spinner eterno não diz que acabou.
+    falha: null,
     player: createPlayer(canvas, {
-      onError: (m) => toast(m, true),
+      onError: (m) => {
+        s.falha = m;
+        toast(m, true);
+        renderGrid();
+      },
       onTamanho: () => {
         s.started = true;
         renderGrid();
@@ -968,6 +984,8 @@ function startStream(slot, config) {
   // A conexão direta está entregando: montar o decodificador do relay agora
   // gastaria memória de GPU para desenhar num canvas que ninguém está vendo.
   if (s.viaRtc) return;
+  // Config nova é chance nova: a falha da anterior não vale para esta.
+  s.falha = null;
   if (!s.player.start(config)) return;
   renderGrid();
   renderBar();
@@ -1123,6 +1141,7 @@ function desistirDoRtc(slot) {
     // O decodificador está frio desde que o relay parou; o servidor manda um
     // keyframe junto com a religada, e é ele que traz a imagem de volta.
     s.started = false;
+    s.falha = null;
     const config = available.get(slot)?.config;
     if (config) s.player.start(config);
     renderGrid();
