@@ -541,3 +541,16 @@ describe('sinalização WebRTC', () => {
     await ate(transmissor, doTipo('need-keyframe'), 'o ponto de partida');
   });
 });
+
+describe('codec recusado', () => {
+  it('leva ao transmissor o codec que o espectador não decodifica', async () => {
+    const { transmissor, espectador, slot } = await noAr();
+
+    espectador.send(JSON.stringify({ type: 'codec-recusado', slot, codec: 'avc1.640028' }));
+
+    expect(await ate(transmissor, doTipo('codec-recusado'), 'o recado')).toEqual({
+      type: 'codec-recusado',
+      codec: 'avc1.640028',
+    });
+  });
+});

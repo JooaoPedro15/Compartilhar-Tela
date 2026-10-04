@@ -857,6 +857,24 @@ export function rtcParaBroadcaster(room, ws, slot, payload) {
   sendJson(entry.ws, { type: 'rtc', peer: ws.__peerId, payload });
 }
 
+// Formato de nome de codec do WebCodecs: "vp8", "avc1.640028", "vp09.00.10.08".
+const NOME_DE_CODEC = /^[a-z0-9]+(\.[a-z0-9]+)*$/i;
+
+/**
+ * Um espectador não conseguiu decodificar o codec desta transmissão.
+ *
+ * Quem escolhe o codec é o transmissor, olhando só para o próprio encoder — e
+ * o app do Discord, por exemplo, não decodifica H.264. O recado vai para ele
+ * trocar; o servidor só confere que vem de alguém que está de fato assistindo
+ * aquela tela, para ninguém da sala conseguir mexer no codec dos outros.
+ */
+export function codecRecusado(room, ws, slot, codec) {
+  const entry = room.slots.get(slot);
+  if (!entry || !entry.streaming || !ws.__watching?.has(slot)) return;
+  if (typeof codec !== 'string' || codec.length > 64 || !NOME_DE_CODEC.test(codec)) return;
+  sendJson(entry.ws, { type: 'codec-recusado', codec });
+}
+
 /** Do transmissor para um espectador nomeado. */
 export function rtcParaViewer(room, entry, peerId, payload) {
   const v = viewerPorPeer(room, peerId);

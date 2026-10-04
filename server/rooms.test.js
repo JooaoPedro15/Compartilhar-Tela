@@ -851,6 +851,43 @@ describe('adminStats', () => {
  * direta entrega, o relay não pode mandar os mesmos bytes de novo, e no instante
  * em que ela cai eles precisam voltar sem que ninguém peça nada.
  */
+describe('codec recusado', () => {
+  it('repassa ao transmissor o codec que um espectador não conseguiu decodificar', () => {
+    const { room, viewer, ws, entry } = comTransmissao();
+
+    R.codecRecusado(room, viewer, entry.slot, 'avc1.640028');
+
+    expect(ws.mensagens()).toContainEqual({ type: 'codec-recusado', codec: 'avc1.640028' });
+  });
+
+  it('só vale para quem está assistindo aquele slot', () => {
+    // Quem não pediu a tela não sabe se consegue decodificá-la: deixar qualquer
+    // um da sala trocar o codec de quem transmite seria um botão de sabotagem.
+    const { room, viewer, ws, entry } = comTransmissao({ assistindo: false });
+
+    R.codecRecusado(room, viewer, entry.slot, 'avc1.640028');
+
+    expect(ws.tipos()).not.toContain('codec-recusado');
+  });
+
+  it('ignora o que não tem cara de nome de codec', () => {
+    const { room, viewer, ws, entry } = comTransmissao();
+
+    R.codecRecusado(room, viewer, entry.slot, { codec: 'objeto' });
+    R.codecRecusado(room, viewer, entry.slot, '<script>');
+    R.codecRecusado(room, viewer, entry.slot, 'a'.repeat(200));
+
+    expect(ws.tipos()).not.toContain('codec-recusado');
+  });
+
+  it('slot que não está no ar não leva aviso a ninguém', () => {
+    const { room, viewer, ws } = comTransmissao();
+
+    expect(() => R.codecRecusado(room, viewer, 99, 'avc1.640028')).not.toThrow();
+    expect(ws.tipos()).not.toContain('codec-recusado');
+  });
+});
+
 describe('WebRTC', () => {
   it('convida o transmissor a abrir conexão direta quando alguém começa a assistir', () => {
     const { room, viewer } = salaComEspectador();

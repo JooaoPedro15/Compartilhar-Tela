@@ -1143,6 +1143,13 @@ function handleViewer(ws, room, auth) {
       return;
     }
 
+    // Este espectador não decodifica o codec da transmissão: o recado vai para
+    // quem transmite, que é quem pode trocar.
+    if (msg.type === 'codec-recusado' && Number.isInteger(msg.slot)) {
+      R.codecRecusado(room, ws, msg.slot, msg.codec);
+      return;
+    }
+
     // Encerrar a própria transmissão de dentro da Activity, sem ter que achar
     // a aba de captura. Cada um só encerra a sua.
     // Ligar a outra fonte sem abrir uma segunda aba: quem já está transmitindo
