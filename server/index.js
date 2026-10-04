@@ -43,6 +43,8 @@ const ADMIN_IDS = new Set(
 );
 const TEM_ADMIN = ADMIN_IDS.size > 0;
 const ADMIN_COOKIE = 'discord_screen_admin';
+// O par do `state` de um login em andamento. Ver iniciarOAuth.
+const OAUTH_COOKIE = 'discord_screen_oauth';
 
 // Prazo de toda chamada ao Discord. fetch não expira sozinho: sem isto, um
 // Discord lento segura a resposta — e quem espera é a pessoa abrindo a
@@ -691,28 +693,64 @@ function discordAuthorizeUrl(state = null) {
   return url;
 }
 
-app.get('/auth/login', (_req, res) => {
-  const url = discordAuthorizeUrl();
-  res.redirect(url.toString());
-});
+const cookieSeguro = () => (PUBLIC_ORIGIN.startsWith('https://') ? '; Secure' : '');
+
+/**
+ * Manda ao Discord um login amarrado a este navegador.
+ *
+ * O `state` sozinho não amarrava nada: assinado, ele provava que nasceu aqui,
+ * mas não *para quem*. Um atacante começava o login no navegador dele e
+ * repassava o link da volta — com o code DELE — para a vítima, que passava a
+ * usar a conta do atacante sem perceber (login CSRF).
+ *
+ * O nonce vai em dois lugares: dentro do state, que viaja pelo Discord, e num
+ * cookie HttpOnly, que fica neste navegador. A volta só é aceita quando os dois
+ * batem, e quem recebe um link de outra pessoa não tem o cookie dela.
+ * SameSite=Lax é o que deixa o cookie acompanhar a volta: ela é uma navegação
+ * de topo vinda do discord.com.
+ */
+function iniciarOAuth(res, target) {
+  const nonce = crypto.randomBytes(16).toString('base64url');
+  res.append(
+    'Set-Cookie',
+    `${OAUTH_COOKIE}=${nonce}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${10 * 60}${cookieSeguro()}`,
+  );
+  const state = signToken({ scope: 'oauth-state', target, nonce }, 10 * 60);
+  res.redirect(discordAuthorizeUrl(state).toString());
+}
+
+app.get('/auth/login', (_req, res) => iniciarOAuth(res, 'web'));
 
 app.get('/admin/auth/login', (_req, res) => {
   if (!TEM_ADMIN) return res.redirect('/admin?error=not_configured');
   if (!DISCORD_CLIENT_ID || !DISCORD_CLIENT_SECRET) {
     return res.redirect('/admin?error=discord_not_configured');
   }
-
-  const state = signToken(
-    { scope: 'oauth-state', target: 'admin', nonce: crypto.randomBytes(12).toString('base64url') },
-    10 * 60,
-  );
-  res.redirect(discordAuthorizeUrl(state).toString());
+  iniciarOAuth(res, 'admin');
 });
 
 app.get('/auth/callback', async (req, res) => {
   const { code, state } = req.query;
   const oauthState = verifyToken(typeof state === 'string' ? state : '');
   const adminFlow = oauthState?.scope === 'oauth-state' && oauthState.target === 'admin';
+
+  // O state precisa ter nascido NESTE navegador: o nonce dele tem de bater com
+  // o do cookie. Ver iniciarOAuth.
+  const nonce = cookieOf(req, OAUTH_COOKIE);
+  const amarrado =
+    oauthState?.scope === 'oauth-state' &&
+    typeof oauthState.nonce === 'string' &&
+    nonce === oauthState.nonce;
+
+  // Vale uma volta só, dê ela certo ou não.
+  res.append(
+    'Set-Cookie',
+    `${OAUTH_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0${cookieSeguro()}`,
+  );
+
+  if (!amarrado) {
+    return res.redirect(adminFlow ? '/admin?error=estado_invalido' : '/?erro=estado_invalido');
+  }
   if (!code) return res.redirect(adminFlow ? '/admin?error=sem_codigo' : '/?erro=sem_codigo');
 
   try {
@@ -754,10 +792,10 @@ app.get('/auth/callback', async (req, res) => {
         },
         8 * 60 * 60,
       );
-      const secure = PUBLIC_ORIGIN.startsWith('https://') ? '; Secure' : '';
-      res.setHeader(
+      // append, e não setHeader: o apagar do cookie do state já está na resposta.
+      res.append(
         'Set-Cookie',
-        `${ADMIN_COOKIE}=${adminSession}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${8 * 60 * 60}${secure}`,
+        `${ADMIN_COOKIE}=${adminSession}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${8 * 60 * 60}${cookieSeguro()}`,
       );
       return res.redirect('/admin');
     }

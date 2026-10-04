@@ -669,6 +669,25 @@ describe('/api/rooms/password', () => {
   });
 });
 
+/**
+ * Começa um login como o navegador começaria: o state vem na URL do Discord e
+ * o par dele, no cookie. Devolve o que a volta precisa levar.
+ */
+async function iniciarLogin(caminho = '/auth/login') {
+  const resposta = await get(caminho);
+  const state = new URL(resposta.headers.get('location')).searchParams.get('state');
+  const cookie = resposta.headers.get('set-cookie')?.split(';')[0] ?? '';
+  return { state, cookie };
+}
+
+/** A volta do Discord, levando o state e o cookie de um login começado aqui. */
+async function voltar(params = 'code=abc', login) {
+  const { state, cookie } = login ?? (await iniciarLogin());
+  return get(`/auth/callback?${params}&state=${encodeURIComponent(state)}`, {
+    headers: { Cookie: cookie },
+  });
+}
+
 describe('login pelo site', () => {
   it('manda para o Discord', async () => {
     const resposta = await get('/auth/login');
@@ -677,14 +696,43 @@ describe('login pelo site', () => {
     expect(resposta.headers.get('location')).toContain('discord.com/oauth2/authorize');
   });
 
+  it('leva um state, e guarda o par dele num cookie que o JavaScript não lê', async () => {
+    const resposta = await get('/auth/login');
+    const state = new URL(resposta.headers.get('location')).searchParams.get('state');
+    const cookie = resposta.headers.get('set-cookie');
+
+    expect(state).toBeTruthy();
+    expect(cookie).toContain('HttpOnly');
+    expect(cookie).toContain('SameSite=Lax');
+  });
+
   it('sem painel configurado, o login administrativo volta dizendo isso', async () => {
     const resposta = await get('/admin/auth/login');
 
     expect(resposta.headers.get('location')).toBe('/admin?error=not_configured');
   });
 
+  it('volta sem state é recusada antes de qualquer troca', async () => {
+    // Login CSRF: sem o state, um link montado por outra pessoa entrega o code
+    // DELA ao navegador de quem clicou, que passa a usar a conta errada.
+    const resposta = await get('/auth/callback?code=abc');
+
+    expect(resposta.headers.get('location')).toBe('/?erro=estado_invalido');
+  });
+
+  it('state válido de outro navegador também é recusado', async () => {
+    // O atacante começa um login no navegador dele e repassa o link da volta:
+    // o state é legítimo, mas o cookie que o acompanha ficou lá.
+    const doAtacante = await iniciarLogin();
+    const daVitima = await iniciarLogin();
+
+    const resposta = await voltar('code=abc', { state: doAtacante.state, cookie: daVitima.cookie });
+
+    expect(resposta.headers.get('location')).toBe('/?erro=estado_invalido');
+  });
+
   it('sem código na volta, avisa em vez de tentar a troca', async () => {
-    const resposta = await get('/auth/callback');
+    const resposta = await voltar('error=access_denied');
 
     expect(resposta.headers.get('location')).toBe('/?erro=sem_codigo');
   });
@@ -692,7 +740,7 @@ describe('login pelo site', () => {
   it('quando o Discord recusa a troca, volta com o motivo na URL', async () => {
     externas.set('https://discord.com/api/oauth2/token', () => json({ error: 'invalid_grant' }));
 
-    const resposta = await get('/auth/callback?code=abc');
+    const resposta = await voltar();
 
     expect(resposta.headers.get('location')).toBe('/?erro=troca_falhou');
   });
@@ -701,20 +749,22 @@ describe('login pelo site', () => {
     externas.set('https://discord.com/api/oauth2/token', () => json({ access_token: 'tok' }));
     externas.set('https://discord.com/api/users/@me', () => json({}));
 
-    const resposta = await get('/auth/callback?code=abc');
+    const resposta = await voltar();
 
     expect(resposta.headers.get('location')).toBe('/?erro=perfil_falhou');
   });
 
-  it('entrega a identidade no fragmento, que não chega ao servidor', async () => {
+  it('entrega a identidade no fragmento, e apaga o cookie do state', async () => {
     externas.set('https://discord.com/api/oauth2/token', () => json({ access_token: 'tok' }));
     externas.set('https://discord.com/api/users/@me', () =>
       json({ id: '123456789012345678', global_name: 'Alice' }),
     );
 
-    const destino = (await get('/auth/callback?code=abc')).headers.get('location');
+    const resposta = await voltar();
 
-    expect(destino).toMatch(/^\/#identity=/);
+    expect(resposta.headers.get('location')).toMatch(/^\/#identity=/);
+    // Usado uma vez: o mesmo par não serve para uma segunda volta.
+    expect(resposta.headers.get('set-cookie')).toContain('Max-Age=0');
   });
 
   it('erro no meio da volta não deixa a pessoa numa tela morta', async () => {
@@ -722,7 +772,7 @@ describe('login pelo site', () => {
       throw new Error('rede fora');
     });
 
-    expect((await get('/auth/callback?code=abc')).headers.get('location')).toBe('/?erro=interno');
+    expect((await voltar()).headers.get('location')).toBe('/?erro=interno');
   });
 
   it('as chamadas ao Discord levam prazo, para um Discord lento não prender o login', async () => {
@@ -736,7 +786,7 @@ describe('login pelo site', () => {
       return json({ id: '123456789012345678', global_name: 'Alice' });
     });
 
-    await get('/auth/callback?code=abc');
+    await voltar();
 
     expect(sinais).toHaveLength(2);
     for (const sinal of sinais) expect(sinal).toBeInstanceOf(AbortSignal);

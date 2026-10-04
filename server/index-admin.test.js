@@ -272,13 +272,31 @@ describe('login administrativo', () => {
     expect(destino.searchParams.get('state')).toBeTruthy();
   });
 
-  const stateAdmin = () => signToken({ scope: 'oauth-state', target: 'admin' }, 600);
+  /** A volta do Discord para um login do painel começado neste navegador. */
+  async function voltaAdmin() {
+    const inicio = await get('/admin/auth/login');
+    const state = new URL(inicio.headers.get('location')).searchParams.get('state');
+    const cookie = inicio.headers.get('set-cookie').split(';')[0];
+    return get(`/auth/callback?code=abc&state=${encodeURIComponent(state)}`, {
+      headers: { Cookie: cookie },
+    });
+  }
+
+  it('recusa um state assinado que não nasceu neste navegador', async () => {
+    // Assinado e válido, mas sem o cookie que o acompanha: é o link que outra
+    // pessoa montou. Antes isso bastava para entrar no fluxo do painel.
+    const avulso = signToken({ scope: 'oauth-state', target: 'admin', nonce: 'x' }, 600);
+
+    const resposta = await get(`/auth/callback?code=abc&state=${avulso}`);
+
+    expect(resposta.headers.get('location')).toBe('/admin?error=estado_invalido');
+  });
 
   it('recusa uma conta que não é a do painel', async () => {
     finge('https://discord.com/api/oauth2/token', () => json({ access_token: 'tok' }));
     finge('https://discord.com/api/users/@me', perfil(OUTRO));
 
-    const resposta = await get(`/auth/callback?code=abc&state=${stateAdmin()}`);
+    const resposta = await voltaAdmin();
 
     expect(resposta.headers.get('location')).toBe('/admin?error=forbidden');
   });
@@ -287,18 +305,19 @@ describe('login administrativo', () => {
     finge('https://discord.com/api/oauth2/token', () => json({ access_token: 'tok' }));
     finge('https://discord.com/api/users/@me', perfil(ADMIN));
 
-    const resposta = await get(`/auth/callback?code=abc&state=${stateAdmin()}`);
-    const cookie = resposta.headers.get('set-cookie');
+    const resposta = await voltaAdmin();
+    const cookies = resposta.headers.getSetCookie();
+    const sessao = cookies.find((c) => c.startsWith('discord_screen_admin='));
 
     expect(resposta.headers.get('location')).toBe('/admin');
-    expect(cookie).toContain('HttpOnly');
-    expect(cookie).toContain('Secure');
+    expect(sessao).toContain('HttpOnly');
+    expect(sessao).toContain('Secure');
   });
 
   it('erros do fluxo voltam para o painel, não para a página inicial', async () => {
     finge('https://discord.com/api/oauth2/token', () => json({ error: 'invalid_grant' }));
 
-    const resposta = await get(`/auth/callback?code=abc&state=${stateAdmin()}`);
+    const resposta = await voltaAdmin();
 
     expect(resposta.headers.get('location')).toBe('/admin?error=troca_falhou');
   });
@@ -307,7 +326,7 @@ describe('login administrativo', () => {
     finge('https://discord.com/api/oauth2/token', () => json({ access_token: 'tok' }));
     finge('https://discord.com/api/users/@me', () => json({}));
 
-    const resposta = await get(`/auth/callback?code=abc&state=${stateAdmin()}`);
+    const resposta = await voltaAdmin();
 
     expect(resposta.headers.get('location')).toBe('/admin?error=perfil_falhou');
   });
