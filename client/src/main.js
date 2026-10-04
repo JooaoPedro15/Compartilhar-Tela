@@ -1,6 +1,7 @@
 import { DiscordSDK } from '@discord/embedded-app-sdk';
 import { createPlayer } from './player.js';
 import { createAudio } from './audio.js';
+import { destinoDaQueda } from './reconexao.js';
 import { createBroadcaster } from '../../shared/broadcaster.js';
 import {
   iceServers,
@@ -43,6 +44,9 @@ let clientId = null;
 let ws = null;
 let participants = [];
 let reconnectDelay = 1000;
+// A reconexão agendada. Guardada para ser cancelada: sair da sala e entrar em
+// outra durante a espera fazia o timer antigo abrir uma segunda conexão.
+let reconnectTimer = null;
 let lagTimer = null;
 // Transmissão nascida aqui dentro, quando o Discord permite capturar no iframe.
 let myBroadcast = null;
@@ -1476,6 +1480,9 @@ function limparSala() {
   roomInfo = null;
   setRoomUrl(null);
 
+  clearTimeout(reconnectTimer);
+  reconnectTimer = null;
+  reconnectDelay = 1000;
   ws?.close();
   ws = null;
 }
@@ -1863,16 +1870,23 @@ async function post(url, body, { retry = true } = {}) {
 // ----------------------------------------------------------------- websocket
 
 function connect() {
+  clearTimeout(reconnectTimer);
+  reconnectTimer = null;
   if (!roomTokens) return;
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  ws = new WebSocket(
+  // `sock` é esta conexão; `ws` é a atual. Os ouvintes abaixo conferem as duas
+  // antes de mexer em qualquer coisa: um socket antigo que fecha ou erra depois
+  // de outro já ter nascido não pode limpar a grade nem fechar o novo.
+  const sock = new WebSocket(
     `${proto}://${location.host}${P}/ws?t=${encodeURIComponent(roomTokens.viewerToken)}`,
   );
-  ws.binaryType = 'arraybuffer';
+  ws = sock;
+  sock.binaryType = 'arraybuffer';
 
   let abriu = false;
 
-  ws.addEventListener('open', () => {
+  sock.addEventListener('open', () => {
+    if (ws !== sock) return;
     abriu = true;
     reconnectDelay = 1000;
     $('grid').hidden = false;
@@ -1887,7 +1901,8 @@ function connect() {
     }
   });
 
-  ws.addEventListener('message', (e) => {
+  sock.addEventListener('message', (e) => {
+    if (ws !== sock) return;
     // Primeiro byte é o slot, segundo é o tipo: um diz de quem, o outro diz
     // para qual decodificador — som e imagem dividem o mesmo canal.
     if (typeof e.data !== 'string') {
@@ -1978,7 +1993,8 @@ function connect() {
     }
   });
 
-  ws.addEventListener('close', () => {
+  sock.addEventListener('close', () => {
+    if (ws !== sock) return;
     closeAllStreams();
     available.clear();
     watching.clear();
@@ -1988,27 +2004,67 @@ function connect() {
     // Saímos da sala de propósito: nada a reconectar.
     if (!roomTokens) return;
 
-    // Fechou sem nunca abrir: o token da sala foi recusado. Guardado, ele não
-    // vale mais depois que o servidor troca o segredo — e reconectar com o
-    // mesmo token repete o 401 até o fim dos tempos. Descartar e recomeçar é o
-    // único caminho que sai daqui.
+    // Fechou sem nunca abrir: pode ser token recusado ou servidor fora do ar,
+    // e daqui não dá para saber qual. Pergunta ao servidor antes de decidir.
     if (!abriu) {
-      const id = roomInfo?.id;
-      limparSala();
-      if (id) remove(`sala:${id}`);
-      toast('Sua sessão expirou. Entrando de novo…');
-      if (inDiscord) entrarNaCall();
-      else showLobby();
+      conferirIngresso(roomTokens);
       return;
     }
 
-    setEmpty('Reconectando…', 'A conexão com a sala caiu.');
-    // Backoff — evita martelar o servidor se ele estiver fora do ar.
-    setTimeout(connect, reconnectDelay);
-    reconnectDelay = Math.min(reconnectDelay * 2, 15_000);
+    agendarReconexao();
   });
 
-  ws.addEventListener('error', () => ws.close());
+  // O socket que errou, e não o atual: depois de uma troca eles são outros.
+  sock.addEventListener('error', () => sock.close());
+}
+
+/** Backoff — evita martelar o servidor se ele estiver fora do ar. */
+function agendarReconexao() {
+  setEmpty('Reconectando…', 'A conexão com a sala caiu.');
+  clearTimeout(reconnectTimer);
+  reconnectTimer = setTimeout(connect, reconnectDelay);
+  reconnectDelay = Math.min(reconnectDelay * 2, 15_000);
+}
+
+/**
+ * A conexão fechou sem abrir: o ingresso morreu, a sala fechou, ou o servidor
+ * só está fora do ar?
+ *
+ * O `/api/rooms/open` confere exatamente o que o upgrade conferiu — assinatura
+ * do token e existência da sala —, mas por HTTP, onde o status chega inteiro.
+ * Ver `destinoDaQueda`.
+ */
+async function conferirIngresso(tokens) {
+  let status = 200;
+  try {
+    await post(`${P}/api/rooms/open`, { token: tokens.viewerToken });
+  } catch (err) {
+    status = err.status ?? 0;
+  }
+
+  // Saiu da sala, ou entrou em outra, enquanto a resposta vinha.
+  if (roomTokens !== tokens) return;
+
+  const destino = destinoDaQueda(status);
+  if (destino === 'tentar') {
+    agendarReconexao();
+    return;
+  }
+
+  // Guardado, um ingresso morto repetiria a recusa até o fim dos tempos:
+  // descartar e recomeçar é o único caminho que sai daqui.
+  const id = roomInfo?.id;
+  limparSala();
+  if (id) remove(`sala:${id}`);
+
+  // No Discord a sala é a da call: ela é recriada, e a atividade volta para ela.
+  if (inDiscord) {
+    if (destino === 'expirou') toast('Sua sessão expirou. Entrando de novo…');
+    entrarNaCall();
+    return;
+  }
+  toast(destino === 'expirou' ? 'Sua sessão expirou. Entrando de novo…' : 'A sala foi fechada.');
+  showLobby();
 }
 
 // --------------------------------------------------------------------- ações
