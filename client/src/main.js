@@ -6,6 +6,7 @@ import { createArmazenamento } from './armazenamento.js';
 import { createAvisos } from './avisos.js';
 import { createApi } from './api.js';
 import { createSessao } from './sessao.js';
+import { createEstadoDaSala } from './estado.js';
 import { createBroadcaster } from '../../shared/broadcaster.js';
 import {
   iceServers,
@@ -46,25 +47,9 @@ const sessao = createSessao({
   aoRenovar: () => renderProfileButton(),
   criarSdk: (id) => new DiscordSDK(id),
 });
-
-// Um decoder e um canvas por transmissor, indexados pelo slot que o servidor
-// atribuiu. Os canvas vivem fora do DOM entre renderizações e são movidos para
-// dentro do tile de cada pessoa — detachar não apaga o conteúdo nem invalida o
-// contexto 2D, então os decoders seguem desenhando sem saber de nada.
-const streams = new Map(); // slot -> { userId, canvas, player }
-
-// Transmissões anunciadas pelo servidor, assistidas ou não. Assistir é opt-in:
-// sem pedir, o servidor nem envia os quadros — a economia de banda depende
-// disso, filtrar só na exibição gastaria a mesma saída.
-const available = new Map(); // slot -> { userId, config }
-const watching = new Set(); // slots que eu pedi para assistir
-
-// Quem tem aba de captura aberta, segundo o servidor. É o que decide entre
-// falar com a aba existente e abrir outra.
-const abas = new Set();
+const estado = createEstadoDaSala();
 
 let ws = null;
-let participants = [];
 let reconnectDelay = 1000;
 // A reconexão agendada. Guardada para ser cancelada: sair da sala e entrar em
 // outra durante a espera fazia o timer antigo abrir uma segunda conexão.
@@ -100,7 +85,7 @@ const volumeEfetivo = (userId) => volume * (volumePessoa.get(userId) ?? 1);
 
 /** Reaplica o volume de um stream depois de qualquer um dos dois mudar. */
 function aplicarVolume(slot) {
-  const s = streams.get(slot);
+  const s = estado.streams.get(slot);
   if (!s) return;
   s.audio?.setVolume(volumeEfetivo(s.userId));
   // Pela conexão direta o som sai do próprio <video>, e não do decodificador
@@ -110,21 +95,6 @@ function aplicarVolume(slot) {
 // Para onde o botão de silenciar volta. Sem isto, desmutar cairia sempre em
 // 100%, ignorando o ajuste que a pessoa tinha feito.
 let volumeAntes = volume || 1;
-// Qual tela está no palco, e se ela ocupa tudo. Guardados fora do render
-// porque a grade é reconstruída a cada mudança de estado da sala, e a escolha
-// de quem assiste precisa sobreviver a isso.
-let activeSlot = null;
-let telaCheia = false;
-// O que o link da atividade pediu: qual tela no palco e se já em tela cheia.
-// Não dá para aplicar no arranque — a sala ainda não tem transmissão nenhuma, e
-// o render zera a escolha justamente nesse estado. Fica guardado até a tela
-// aparecer.
-// Não tem prazo de propósito. Tinha, e era uma corrida perdida: se o estado da
-// sala demorasse — aba aberta em segundo plano, WebSocket lento, ninguém
-// transmitindo ainda — a intenção morria antes de poder ser cumprida, e a
-// pessoa caía no convite que o link existia para pular. Ela se apaga sozinha ao
-// ser usada, que é a única condição que importa.
-let chegada = null;
 
 // ------------------------------------------------------------------- helpers
 
@@ -157,28 +127,6 @@ function initials(name) {
     .toUpperCase();
 }
 
-/** Todas as transmissões de uma pessoa — hoje até duas: a tela e a câmera. */
-const slotsOf = (userId) =>
-  [...available.entries()].filter(([, a]) => a.userId === userId).map(([slot]) => slot);
-
-/**
- * O que o grid desenha: uma entrada por transmissão, mais uma por pessoa que
- * não está transmitindo.
- *
- * Antes era uma entrada por pessoa, com o slot deduzido dela. Bastava enquanto
- * ninguém podia ter duas — a partir da câmera, a segunda transmissão
- * simplesmente não aparecia, e o motivo não ficava visível em lugar nenhum.
- */
-function entradasDoGrid() {
-  const saida = [];
-  for (const p of participants) {
-    const slots = p.broadcasting ? slotsOf(p.id) : [];
-    if (!slots.length) saida.push({ p, slot: null });
-    else for (const slot of slots) saida.push({ p, slot });
-  }
-  return saida;
-}
-
 /**
  * O nó que mostra esta transmissão agora: canvas do relay ou vídeo da conexão
  * direta. Só um dos dois está no DOM por vez, e trocar de um para o outro é o
@@ -193,9 +141,9 @@ function medidaDe(s) {
 }
 
 function watchSlot(slot) {
-  const info = available.get(slot);
+  const info = estado.available.get(slot);
   if (!info) return;
-  watching.add(slot);
+  estado.watching.add(slot);
   ws?.send(JSON.stringify({ type: 'watch', slot }));
   // O config pode já ter chegado; se não, ele chega logo e dispara o start.
   if (info.config) {
@@ -206,7 +154,7 @@ function watchSlot(slot) {
 }
 
 function unwatchSlot(slot) {
-  watching.delete(slot);
+  estado.watching.delete(slot);
   ws?.send(JSON.stringify({ type: 'unwatch', slot }));
   closeStream(slot);
   renderGrid();
@@ -270,7 +218,7 @@ divider.addEventListener('pointerdown', (e) => {
 });
 
 divider.addEventListener('dblclick', () => setStrip(STRIP_DEFAULT));
-window.addEventListener('resize', () => inRoom() && applyStrip());
+window.addEventListener('resize', () => estado.inRoom() && applyStrip());
 
 /**
  * Duas formas de mostrar a sala, e o que decide é ter alguém transmitindo.
@@ -286,7 +234,7 @@ function renderGrid() {
   // Fora de uma sala quem manda é o lobby. Sem esta guarda, o render disparado
   // pelo fechamento do WebSocket mostrava o painel "Ninguém na sala" por cima
   // da lista de salas.
-  if (!inRoom()) {
+  if (!estado.inRoom()) {
     grid.hidden = true;
     $('empty').hidden = true;
     $('fullscreen').hidden = true;
@@ -295,19 +243,19 @@ function renderGrid() {
     return;
   }
 
-  const hasPeople = participants.length > 0;
+  const hasPeople = estado.participants.length > 0;
   $('empty').hidden = hasPeople;
   grid.hidden = !hasPeople;
 
-  const casters = participants.filter((p) => p.broadcasting);
+  const casters = estado.participants.filter((p) => p.broadcasting);
 
   if (!casters.length) {
-    activeSlot = null;
-    telaCheia = false;
-  } else if (activeSlot === null || !available.has(activeSlot)) {
+    estado.activeSlot = null;
+    estado.telaCheia = false;
+  } else if (estado.activeSlot === null || !estado.available.has(estado.activeSlot)) {
     // Sempre há uma tela em destaque quando existe transmissão: chegar numa
     // sala com tela no ar e ver só avatares esconderia o que importa.
-    activeSlot = entradasDoGrid().find((e) => e.slot !== null)?.slot ?? null;
+    estado.activeSlot = estado.entradasDoGrid().find((e) => e.slot !== null)?.slot ?? null;
   }
 
   // Quem chegou pelo link da atividade já pediu para assistir lá atrás: parar
@@ -320,35 +268,35 @@ function renderGrid() {
   //
   // Só espera enquanto não houver tela nenhuma: aí não há o que assistir, e a
   // intenção fica de pé até alguém transmitir ou o prazo dela vencer.
-  if (chegada && activeSlot === null) {
+  if (estado.chegada && estado.activeSlot === null) {
     console.info('[sala] link pediu para assistir, mas ninguém está transmitindo ainda');
   }
 
-  if (chegada && activeSlot !== null) {
-    const pedida = chegada.slot;
-    const alvo = pedida !== null && available.has(pedida) ? pedida : activeSlot;
+  if (estado.chegada && estado.activeSlot !== null) {
+    const pedida = estado.chegada.slot;
+    const alvo = pedida !== null && estado.available.has(pedida) ? pedida : estado.activeSlot;
     console.info('[sala] assistindo automaticamente', {
       pedida,
       alvo,
-      slots: [...available.keys()],
+      slots: [...estado.available.keys()],
     });
     // Zerado antes de qualquer coisa: watchSlot renderiza de novo, e a segunda
     // passada não pode reabrir este mesmo caminho.
-    const cheia = chegada.cheia;
-    chegada = null;
+    const cheia = estado.chegada.cheia;
+    estado.chegada = null;
 
-    activeSlot = alvo;
-    telaCheia = cheia;
+    estado.activeSlot = alvo;
+    estado.telaCheia = cheia;
     // Adiado porque watchSlot chama renderGrid, e estamos dentro de um.
-    if (!watching.has(alvo)) queueMicrotask(() => watchSlot(alvo));
+    if (!estado.watching.has(alvo)) queueMicrotask(() => watchSlot(alvo));
   }
 
-  const noPalco = activeSlot !== null;
+  const noPalco = estado.activeSlot !== null;
   $('fullscreen').hidden = !noPalco;
   // A classe vai no #app, e não na grade: quem sai do layout são as barras, que
   // são irmãs dela. Fica acima do `return` de sala vazia — senão as barras
   // continuariam flutuando sobre o painel de "ninguém na sala".
-  $('app').classList.toggle('cheia', noPalco && telaCheia);
+  $('app').classList.toggle('cheia', noPalco && estado.telaCheia);
   // Dentro da sala as barras sempre flutuam, tendo transmissão ou não: a barra
   // não deve pular de lugar quando alguém começa a transmitir, e um dock que
   // muda de posição sozinho é a mesma barra parecendo duas.
@@ -357,10 +305,10 @@ function renderGrid() {
   // se quer descobrir. Sobre uma grade de avatares o sumiço não revelaria nada
   // e só faria os controles parecerem quebrados.
   $('app').classList.toggle('palco', noPalco);
-  $('fullscreen').classList.toggle('on', telaCheia);
+  $('fullscreen').classList.toggle('on', estado.telaCheia);
   // A dica e o nome acessível andam juntos: o botão faz duas coisas conforme o
   // estado, e anunciar sempre a mesma coisa mentiria para quem usa leitor.
-  const rotulo = telaCheia ? 'Sair da tela cheia' : 'Tela cheia';
+  const rotulo = estado.telaCheia ? 'Sair da tela cheia' : 'Tela cheia';
   $('fullscreen').dataset.tip = rotulo;
   $('fullscreen').setAttribute('aria-label', rotulo);
 
@@ -374,25 +322,25 @@ function renderGrid() {
   if (!hasPeople) return;
 
   grid.classList.toggle('palco', noPalco);
-  grid.classList.toggle('cheia', noPalco && telaCheia);
+  grid.classList.toggle('cheia', noPalco && estado.telaCheia);
 
   // Com a lateral no ar, a contagem no topo repete o que está logo ali — e
   // custa uma faixa inteira de altura, que é o que falta para a tela. Vazia, a
   // barra de cima se recolhe sozinha.
-  $('people').hidden = noPalco && !telaCheia;
+  $('people').hidden = noPalco && !estado.telaCheia;
 
   // Os canvas são reanexados abaixo; removê-los daqui não perde o conteúdo.
   grid.replaceChildren();
 
   if (!noPalco) {
-    const entradas = entradasDoGrid();
+    const entradas = estado.entradasDoGrid();
     grid.style.setProperty('--cols', columnsFor(entradas.length));
     grid.append(...entradas.map((e) => buildTile(e.p, { slot: e.slot }).el));
     return;
   }
 
-  const dono = available.get(activeSlot)?.userId;
-  const emCena = participants.find((p) => p.id === dono) ?? {
+  const dono = estado.available.get(estado.activeSlot)?.userId;
+  const emCena = estado.participants.find((p) => p.id === dono) ?? {
     id: dono ?? 'desconhecido',
     name: 'Transmitindo',
     broadcasting: true,
@@ -400,9 +348,9 @@ function renderGrid() {
   // O slot em destaque, e não o da pessoa: cada transmissão tem um nó de canvas
   // só, então montar o palco com o slot errado o arranca do tile que o estava
   // mostrando — e um dos dois fica preto, conforme a ordem do desenho.
-  grid.append(buildTile(emCena, { palco: true, slot: activeSlot }).el);
+  grid.append(buildTile(emCena, { palco: true, slot: estado.activeSlot }).el);
 
-  if (telaCheia) return;
+  if (estado.telaCheia) return;
 
   applyStrip();
   grid.append(divider, buildSidebar());
@@ -421,7 +369,9 @@ function buildSidebar() {
 
   // Por transmissão, e não por pessoa: quem divide tela e câmera tem duas
   // miniaturas aqui, e a que está no palco é a única que não se repete.
-  const outras = entradasDoGrid().filter((e) => e.slot !== null && e.slot !== activeSlot);
+  const outras = estado
+    .entradasDoGrid()
+    .filter((e) => e.slot !== null && e.slot !== estado.activeSlot);
   if (outras.length) {
     barra.append(secaoTitulo(outras.length === 1 ? 'Outra transmissão' : 'Outras transmissões'));
     for (const e of outras) barra.append(buildTile(e.p, { slot: e.slot }).el);
@@ -434,7 +384,7 @@ function buildSidebar() {
   // enquanto a miniatura ao lado mostrava a tela.
   const gente = document.createElement('div');
   gente.className = 'sidebar-people';
-  for (const p of participants) gente.append(buildTile(p, { semVideo: true }).el);
+  for (const p of estado.participants) gente.append(buildTile(p, { semVideo: true }).el);
   barra.append(gente);
 
   return barra;
@@ -460,9 +410,11 @@ function contagemPessoas() {
     '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M17 20v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/>' +
     '<circle cx="9" cy="7" r="4"/><path d="M23 20v-2a4 4 0 0 0-3-3.87"/>' +
     '<path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>';
-  chip.append(document.createTextNode(String(participants.length)));
+  chip.append(document.createTextNode(String(estado.participants.length)));
   chip.title =
-    participants.length === 1 ? '1 pessoa na sala' : `${participants.length} pessoas na sala`;
+    estado.participants.length === 1
+      ? '1 pessoa na sala'
+      : `${estado.participants.length} pessoas na sala`;
   return chip;
 }
 
@@ -481,7 +433,7 @@ function buildTile(p, { palco = false, semVideo = false, slot: slotDado = null }
   // duas fontes por pessoa não existe "a transmissão dela". Quem passa
   // `semVideo` quer só o avatar, e aí não há slot para acertar.
   const slot = p.broadcasting && !semVideo ? slotDado : null;
-  const stream = slot !== null ? streams.get(slot) : null;
+  const stream = slot !== null ? estado.streams.get(slot) : null;
   const isMe = p.id === sessao.atual?.user?.id;
 
   const tile = document.createElement('div');
@@ -498,7 +450,7 @@ function buildTile(p, { palco = false, semVideo = false, slot: slotDado = null }
 
   // Sem rótulo, dois tiles da mesma pessoa lado a lado no grid não se
   // distinguem até alguém clicar em um deles.
-  if (slot !== null && available.get(slot)?.fonte === 'camera') {
+  if (slot !== null && estado.available.get(slot)?.fonte === 'camera') {
     const marca = document.createElement('span');
     marca.className = 'tile-fonte';
     marca.textContent = 'Câmera';
@@ -506,15 +458,15 @@ function buildTile(p, { palco = false, semVideo = false, slot: slotDado = null }
   }
 
   const aoClicar = () => {
-    if (palco) telaCheia = !telaCheia;
-    else activeSlot = slot;
+    if (palco) estado.telaCheia = !estado.telaCheia;
+    else estado.activeSlot = slot;
     renderGrid();
   };
 
   if (stream) {
     tile.append(noDe(stream));
     tile.title = palco
-      ? telaCheia
+      ? estado.telaCheia
         ? 'Clique para sair da tela cheia'
         : 'Clique para ver em tela cheia'
       : 'Clique para ver em destaque';
@@ -596,7 +548,7 @@ function buildFalha(motivo) {
 
 /** Quantas pessoas assistem esta tela; a lista aparece ao passar o mouse. */
 function buildWatchers(slot) {
-  const people = available.get(slot)?.watchers ?? [];
+  const people = estado.available.get(slot)?.watchers ?? [];
 
   const badge = document.createElement('div');
   badge.className = 'tile-watchers';
@@ -631,7 +583,7 @@ function buildWatchers(slot) {
 
 /** Tela cinza com o convite para assistir — nada é baixado até clicar. */
 function buildWatchPrompt(slot, name, isMe) {
-  const camera = available.get(slot)?.fonte === 'camera';
+  const camera = estado.available.get(slot)?.fonte === 'camera';
   const wrap = document.createElement('div');
   wrap.className = 'watch-prompt';
 
@@ -671,7 +623,7 @@ function buildWatchPrompt(slot, name, isMe) {
 
 function renderProfileButton() {
   if (!sessao.atual) return;
-  const me = participants.find((p) => p.id === sessao.atual.user.id) ?? sessao.atual.user;
+  const me = estado.participants.find((p) => p.id === sessao.atual.user.id) ?? sessao.atual.user;
 
   // A identidade vive só no cabeçalho do lobby agora: bolinha com nome.
   const name = document.createElement('span');
@@ -684,7 +636,7 @@ $('lobbyUser').addEventListener('click', openProfile);
 
 function openProfile() {
   if (!sessao.atual) return;
-  const me = participants.find((p) => p.id === sessao.atual.user.id) ?? sessao.atual.user;
+  const me = estado.participants.find((p) => p.id === sessao.atual.user.id) ?? sessao.atual.user;
 
   $('profileAvatar').replaceChildren(buildAvatar({ ...me, id: sessao.atual.user.id }));
   $('profileName').textContent = me.name;
@@ -742,7 +694,7 @@ function openTileMenu(x, y, slot, name) {
 
   // O cursor só aparece onde há som para ajustar: oferecer um controle que não
   // faz nada é pior do que não oferecer nenhum.
-  const stream = streams.get(slot);
+  const stream = estado.streams.get(slot);
   if (stream?.audio) menu.append(buildMenuVolume(stream.userId, name, slot));
 
   const item = document.createElement('button');
@@ -854,7 +806,7 @@ function buildPeopleList() {
   const list = document.createElement('div');
   list.className = 'hover-list';
 
-  if (!participants.length) {
+  if (!estado.participants.length) {
     const empty = document.createElement('span');
     empty.className = 'hover-empty';
     empty.textContent = 'Ninguém na sala';
@@ -862,7 +814,7 @@ function buildPeopleList() {
     return list;
   }
 
-  for (const p of participants) {
+  for (const p of estado.participants) {
     const row = document.createElement('span');
     row.className = 'hover-row';
     if (p.broadcasting) {
@@ -888,12 +840,12 @@ function renderBar() {
       '<circle cx="9" cy="7" r="4"/><path d="M23 20v-2a4 4 0 0 0-3-3.87"/>' +
       '<path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>',
   );
-  $('people').append(document.createTextNode(String(participants.length)));
+  $('people').append(document.createTextNode(String(estado.participants.length)));
   $('people').append(buildPeopleList());
 
-  const casters = participants.filter((p) => p.broadcasting);
+  const casters = estado.participants.filter((p) => p.broadcasting);
 
-  const minhas = minhasFontes();
+  const minhas = estado.minhasFontes(sessao.atual?.user?.id);
   const telaNoAr = minhas.has('tela') || Boolean(myBroadcast);
   const cameraNoAr = minhas.has('camera');
 
@@ -915,7 +867,7 @@ function renderBar() {
   cam.setAttribute('aria-label', rotuloCam);
 
   // O controle de som só existe quando há som para controlar.
-  const temSom = [...streams.values()].some((s) => s.audio);
+  const temSom = [...estado.streams.values()].some((s) => s.audio);
   $('volumeBox').hidden = !temSom;
   renderVolume();
 
@@ -924,7 +876,7 @@ function renderBar() {
   $('pWho').textContent = casters.length ? casters.map((p) => p.name).join(', ') : 'ninguém';
 }
 
-// ------------------------------------------------------------------- streams
+// ------------------------------------------------------------------- estado.streams
 
 /** Prepara o lugar do transmissor; o decoder só nasce quando o config chega. */
 function openStream(slot, userId) {
@@ -974,12 +926,12 @@ function openStream(slot, userId) {
     audio: null,
   };
 
-  streams.set(slot, s);
+  estado.streams.set(slot, s);
 }
 
 /** Liga o som desta transmissão. Chamado quando a config de áudio chega. */
 function startAudio(slot, config) {
-  const s = streams.get(slot);
+  const s = estado.streams.get(slot);
   if (!s) return;
 
   s.audio?.stop();
@@ -992,7 +944,7 @@ function startAudio(slot, config) {
 }
 
 function startStream(slot, config) {
-  const s = streams.get(slot);
+  const s = estado.streams.get(slot);
   if (!s) return;
   // A conexão direta está entregando: montar o decodificador do relay agora
   // gastaria memória de GPU para desenhar num canvas que ninguém está vendo.
@@ -1006,23 +958,23 @@ function startStream(slot, config) {
 }
 
 function closeStream(slot) {
-  const s = streams.get(slot);
+  const s = estado.streams.get(slot);
   if (!s) return;
   s.player.stop();
   s.audio?.stop();
   fecharPeer(s);
   s.canvas.remove();
   s.video.remove();
-  streams.delete(slot);
+  estado.streams.delete(slot);
   // Quem estava no palco saiu: renderGrid escolhe a próxima na próxima passada.
-  if (activeSlot === slot) activeSlot = null;
+  if (estado.activeSlot === slot) estado.activeSlot = null;
 }
 
 function endStream(slot) {
-  if (!streams.has(slot)) return;
+  if (!estado.streams.has(slot)) return;
   closeStream(slot);
 
-  if (streams.size === 0) {
+  if (estado.streams.size === 0) {
     clearInterval(lagTimer);
     lagTimer = null;
     for (const id of ['pLag', 'pFps', 'pRes']) $(id).textContent = '—';
@@ -1033,7 +985,7 @@ function endStream(slot) {
 }
 
 function closeAllStreams() {
-  for (const slot of [...streams.keys()]) closeStream(slot);
+  for (const slot of [...estado.streams.keys()]) closeStream(slot);
   clearInterval(lagTimer);
   lagTimer = null;
 }
@@ -1053,7 +1005,7 @@ function closeAllStreams() {
  * que chegar de fato pela conexão direta, e não um instante antes.
  */
 async function receberOferta(slot, sdp) {
-  const s = streams.get(slot);
+  const s = estado.streams.get(slot);
   if (!s || !suportaWebRTC()) return;
 
   // Oferta nova para um slot que já tinha conexão significa que o outro lado
@@ -1063,7 +1015,7 @@ async function receberOferta(slot, sdp) {
   try {
     const ice = await iceServers(P);
     // Deu tempo de a transmissão acabar enquanto a lista vinha.
-    if (streams.get(slot) !== s) return;
+    if (estado.streams.get(slot) !== s) return;
 
     const pc = criarPeer({
       ice,
@@ -1101,7 +1053,7 @@ async function receberOferta(slot, sdp) {
 }
 
 async function receberIce(slot, candidate) {
-  const pc = streams.get(slot)?.pc;
+  const pc = estado.streams.get(slot)?.pc;
   if (!pc || !candidate) return;
   try {
     await pc.addIceCandidate(candidate);
@@ -1113,7 +1065,7 @@ async function receberIce(slot, candidate) {
 
 /** A conexão direta entregou o primeiro quadro: ela assume, e o relay sai. */
 function assumirRtc(slot) {
-  const s = streams.get(slot);
+  const s = estado.streams.get(slot);
   if (!s || s.viaRtc) return;
 
   s.viaRtc = true;
@@ -1144,7 +1096,7 @@ function assumirRtc(slot) {
  * basta o servidor voltar a mandar os bytes, e é isso que o aviso faz.
  */
 function desistirDoRtc(slot) {
-  const s = streams.get(slot);
+  const s = estado.streams.get(slot);
   if (!s) return;
 
   const estava = s.viaRtc;
@@ -1155,13 +1107,13 @@ function desistirDoRtc(slot) {
     // keyframe junto com a religada, e é ele que traz a imagem de volta.
     s.started = false;
     s.falha = null;
-    const config = available.get(slot)?.config;
+    const config = estado.available.get(slot)?.config;
     if (config) s.player.start(config);
     renderGrid();
     renderBar();
   }
 
-  if (watching.has(slot)) ws?.send(JSON.stringify({ type: 'rtc-ativo', slot, on: false }));
+  if (estado.watching.has(slot)) ws?.send(JSON.stringify({ type: 'rtc-ativo', slot, on: false }));
 }
 
 function fecharPeer(s) {
@@ -1205,7 +1157,7 @@ function quadrosDoVideo(s) {
 function ensureStatsTimer() {
   if (lagTimer) return;
   lagTimer = setInterval(() => {
-    const s = streams.get(activeSlot) ?? streams.values().next().value;
+    const s = estado.streams.get(estado.activeSlot) ?? estado.streams.values().next().value;
     if (!s) return;
 
     // Pela conexão direta quem conta os quadros é o próprio elemento de vídeo,
@@ -1324,11 +1276,11 @@ async function abrirPeloIngresso(ingresso) {
   // links antigos, sem esses dois, continuam valendo.
   const pedido = params.get('slot');
   const numero = Number(pedido);
-  chegada = {
+  estado.chegada = {
     slot: pedido !== null && Number.isInteger(numero) ? numero : null,
     cheia: params.get('cheia') !== '0',
   };
-  console.info('[sala] chegou pelo link da atividade', chegada);
+  console.info('[sala] chegou pelo link da atividade', estado.chegada);
 
   try {
     const { name, ...tokens } = await post(`${P}/api/rooms/open`, { token: ingresso });
@@ -1371,16 +1323,8 @@ $('loginBtn').addEventListener('click', () => {
 
 // -------------------------------------------------------------------- lobby
 
-/** Tokens da sala atual. null = estamos no lobby. */
-let roomTokens = null;
-let roomInfo = null;
 let joinTarget = null;
-let lastRoomState = null;
 let lobbyRooms = [];
-
-function inRoom() {
-  return roomTokens !== null;
-}
 
 // A lista precisa se atualizar sozinha: salas abrem, enchem e fecham enquanto
 // alguém olha o lobby parado.
@@ -1399,16 +1343,16 @@ function limparSala() {
   stopMyBroadcast();
 
   closeAllStreams();
-  available.clear();
-  watching.clear();
-  participants = [];
-  lastRoomState = null;
-  activeSlot = null;
-  telaCheia = false;
+  estado.available.clear();
+  estado.watching.clear();
+  estado.participants = [];
+  estado.lastRoomState = null;
+  estado.activeSlot = null;
+  estado.telaCheia = false;
 
-  if (roomInfo) remove(`sala:${roomInfo.id}`);
-  roomTokens = null;
-  roomInfo = null;
+  if (estado.roomInfo) remove(`sala:${estado.roomInfo.id}`);
+  estado.roomTokens = null;
+  estado.roomInfo = null;
   setRoomUrl(null);
 
   clearTimeout(reconnectTimer);
@@ -1590,8 +1534,8 @@ function setRoomUrl(id) {
 }
 
 function openRoom(tokens, room) {
-  roomTokens = tokens;
-  roomInfo = room;
+  estado.roomTokens = tokens;
+  estado.roomInfo = room;
 
   setRoomUrl(room.id);
   store(`sala:${room.id}`, JSON.stringify({ tokens, name: room.name }));
@@ -1673,13 +1617,13 @@ function checkVersion(asset) {
 function connect() {
   clearTimeout(reconnectTimer);
   reconnectTimer = null;
-  if (!roomTokens) return;
+  if (!estado.roomTokens) return;
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   // `sock` é esta conexão; `ws` é a atual. Os ouvintes abaixo conferem as duas
   // antes de mexer em qualquer coisa: um socket antigo que fecha ou erra depois
   // de outro já ter nascido não pode limpar a grade nem fechar o novo.
   const sock = new WebSocket(
-    `${proto}://${location.host}${P}/ws?t=${encodeURIComponent(roomTokens.viewerToken)}`,
+    `${proto}://${location.host}${P}/ws?t=${encodeURIComponent(estado.roomTokens.viewerToken)}`,
   );
   ws = sock;
   sock.binaryType = 'arraybuffer';
@@ -1708,7 +1652,7 @@ function connect() {
     // para qual decodificador — som e imagem dividem o mesmo canal.
     if (typeof e.data !== 'string') {
       const view = new DataView(e.data);
-      const s = streams.get(view.getUint8(0));
+      const s = estado.streams.get(view.getUint8(0));
       if (!s) return;
       if (view.getUint8(1) === 3) s.audio?.push(e.data);
       else s.player.push(e.data);
@@ -1725,61 +1669,66 @@ function connect() {
     }
 
     if (msg.type === 'state') {
-      participants = msg.participants ?? [];
-      abas.clear();
-      for (const uid of msg.abas ?? []) abas.add(uid);
+      estado.participants = msg.participants ?? [];
+      estado.abas.clear();
+      for (const uid of msg.abas ?? []) estado.abas.add(uid);
 
-      lastRoomState = msg.room ?? null;
+      estado.lastRoomState = msg.room ?? null;
 
       // A senha da sala só aparece para quem a criou.
       $('roomPill').textContent =
-        `${lastRoomState?.locked ? '🔒 ' : ''}${lastRoomState?.name ?? ''}`;
-      $('roomSettings').hidden = lastRoomState?.ownerId !== sessao.atual?.user?.id;
-      $('roomSettings').classList.toggle('on', Boolean(lastRoomState?.locked));
+        `${estado.lastRoomState?.locked ? '🔒 ' : ''}${estado.lastRoomState?.name ?? ''}`;
+      $('roomSettings').hidden = estado.lastRoomState?.ownerId !== sessao.atual?.user?.id;
+      $('roomSettings').classList.toggle('on', Boolean(estado.lastRoomState?.locked));
 
       // Limpa o que sumiu sem stream-stop (queda abrupta, por exemplo).
       const live = new Set((msg.streams ?? []).map((s) => s.slot));
       for (const s of msg.streams ?? []) {
-        const info = available.get(s.slot) ?? { userId: s.userId, config: null };
+        const info = estado.available.get(s.slot) ?? { userId: s.userId, config: null };
         info.watchers = s.watchers ?? [];
         // Servidor antigo não manda fonte; tela é o que sempre houve.
         info.fonte = s.fonte ?? 'tela';
-        available.set(s.slot, info);
+        estado.available.set(s.slot, info);
       }
-      for (const slot of [...available.keys()]) if (!live.has(slot)) available.delete(slot);
-      for (const slot of [...streams.keys()]) if (!live.has(slot)) closeStream(slot);
-      for (const slot of [...watching]) if (!live.has(slot)) watching.delete(slot);
+      for (const slot of [...estado.available.keys()])
+        if (!live.has(slot)) estado.available.delete(slot);
+      for (const slot of [...estado.streams.keys()]) if (!live.has(slot)) closeStream(slot);
+      for (const slot of [...estado.watching]) if (!live.has(slot)) estado.watching.delete(slot);
       renderGrid();
       renderBar();
     } else if (msg.type === 'stream-start') {
       // Só anuncia; ninguém assiste até pedir.
-      available.set(msg.slot, { userId: msg.userId, fonte: msg.fonte ?? 'tela', config: null });
-      watching.delete(msg.slot);
+      estado.available.set(msg.slot, {
+        userId: msg.userId,
+        fonte: msg.fonte ?? 'tela',
+        config: null,
+      });
+      estado.watching.delete(msg.slot);
       closeStream(msg.slot);
       renderGrid();
     } else if (msg.type === 'config') {
-      const info = available.get(msg.slot);
+      const info = estado.available.get(msg.slot);
       if (info) info.config = msg.config;
-      if (watching.has(msg.slot)) {
+      if (estado.watching.has(msg.slot)) {
         // Config nova no meio da transmissao e so troca de resolucao — a tela
         // compartilhada foi para tela cheia, por exemplo. Recriar o stream aqui
         // levava o audio junto (closeStream para o AudioContext e zera
         // s.audio), e o audio-config so e enviado uma vez por transmissao: o
         // som nunca voltava. startStream ja reconfigura o decoder de video
         // sozinho, entao o lugar so precisa existir na primeira vez.
-        if (!streams.has(msg.slot)) openStream(msg.slot, info?.userId ?? msg.slot);
+        if (!estado.streams.has(msg.slot)) openStream(msg.slot, info?.userId ?? msg.slot);
         startStream(msg.slot, msg.config);
       }
     } else if (msg.type === 'audio-config') {
       // Pode chegar antes de eu pedir para assistir; aí não há o que ligar, e
       // o servidor reenvia assim que o pedido chegar.
-      if (watching.has(msg.slot)) startAudio(msg.slot, msg.config);
+      if (estado.watching.has(msg.slot)) startAudio(msg.slot, msg.config);
     } else if (msg.type === 'stream-stop') {
-      available.delete(msg.slot);
-      watching.delete(msg.slot);
+      estado.available.delete(msg.slot);
+      estado.watching.delete(msg.slot);
       endStream(msg.slot);
     } else if (msg.type === 'room-gone') {
-      roomTokens = null;
+      estado.roomTokens = null;
       // No Discord a sala é a da call: ela é recriada e a atividade volta para
       // ela. No site, quem some é a sala escolhida, então o lugar é a lista.
       if (inDiscord) {
@@ -1797,18 +1746,18 @@ function connect() {
   sock.addEventListener('close', () => {
     if (ws !== sock) return;
     closeAllStreams();
-    available.clear();
-    watching.clear();
-    participants = [];
+    estado.available.clear();
+    estado.watching.clear();
+    estado.participants = [];
     renderGrid();
 
     // Saímos da sala de propósito: nada a reconectar.
-    if (!roomTokens) return;
+    if (!estado.roomTokens) return;
 
     // Fechou sem nunca abrir: pode ser token recusado ou servidor fora do ar,
     // e daqui não dá para saber qual. Pergunta ao servidor antes de decidir.
     if (!abriu) {
-      conferirIngresso(roomTokens);
+      conferirIngresso(estado.roomTokens);
       return;
     }
 
@@ -1844,7 +1793,7 @@ async function conferirIngresso(tokens) {
   }
 
   // Saiu da sala, ou entrou em outra, enquanto a resposta vinha.
-  if (roomTokens !== tokens) return;
+  if (estado.roomTokens !== tokens) return;
 
   const destino = destinoDaQueda(status);
   if (destino === 'tentar') {
@@ -1854,7 +1803,7 @@ async function conferirIngresso(tokens) {
 
   // Guardado, um ingresso morto repetiria a recusa até o fim dos tempos:
   // descartar e recomeçar é o único caminho que sai daqui.
-  const id = roomInfo?.id;
+  const id = estado.roomInfo?.id;
   limparSala();
   if (id) remove(`sala:${id}`);
 
@@ -1876,23 +1825,16 @@ async function conferirIngresso(tokens) {
  * myBroadcast entra no OU porque o `state` leva um instante para chegar, e sem
  * isso o botão pisca de volta para "Compartilhar" logo após começar.
  */
-/** As fontes que eu estou transmitindo agora, segundo o servidor. */
-function minhasFontes() {
-  const meu = sessao.atual?.user?.id;
-  if (!meu) return new Set();
-  return new Set(slotsOf(meu).map((slot) => available.get(slot)?.fonte ?? 'tela'));
-}
-
 /**
  * Existe uma aba de captura minha conectada?
  *
- * Quem responde é o servidor, pela lista `abas` do estado. Antes isto era
+ * Quem responde é o servidor, pela lista `estado.abas` do estado. Antes isto era
  * deduzido do que estava no ar, e errava justamente no caso que mais importa:
  * a aba recém-aberta, ainda sem transmitir, ficava invisível — e um novo clique
  * abria outra em cima dela.
  */
 function abaAberta() {
-  return abas.has(sessao.atual?.user?.id);
+  return estado.abas.has(sessao.atual?.user?.id);
 }
 
 /**
@@ -1986,7 +1928,7 @@ function trazerAba(fonte) {
 }
 
 async function abrirCaptura(fonte) {
-  if (!roomTokens) return;
+  if (!estado.roomTokens) return;
 
   // Só a tela tem chance de nascer aqui dentro; o Discord anula o getUserMedia
   // no iframe, então a câmera vai direto para a aba.
@@ -1997,7 +1939,7 @@ async function abrirCaptura(fonte) {
 
 /** O endereço da página de captura, já com as opções e a fonte pedida. */
 function urlDaCaptura(fonte) {
-  const url = new URL(roomTokens.shareUrl);
+  const url = new URL(estado.roomTokens.shareUrl);
   for (const [chave, valor] of Object.entries(opcoesDaFonte())) {
     url.searchParams.set(chave, valor);
   }
@@ -2006,7 +1948,7 @@ function urlDaCaptura(fonte) {
 }
 
 async function abrirLink(fonte) {
-  if (!roomTokens) return;
+  if (!estado.roomTokens) return;
   const url = urlDaCaptura(fonte).toString();
 
   if (inDiscord) {
@@ -2036,7 +1978,7 @@ async function abrirLink(fonte) {
  */
 function origemDoSite() {
   try {
-    return new URL(roomTokens.shareUrl).origin;
+    return new URL(estado.roomTokens.shareUrl).origin;
   } catch {
     return null;
   }
@@ -2054,16 +1996,16 @@ function origemDoSite() {
  */
 function urlDoSite(origem) {
   const url = new URL(origem);
-  url.searchParams.set('t', roomTokens.viewerToken);
-  if (activeSlot !== null) {
-    url.searchParams.set('slot', String(activeSlot));
+  url.searchParams.set('t', estado.roomTokens.viewerToken);
+  if (estado.activeSlot !== null) {
+    url.searchParams.set('slot', String(estado.activeSlot));
     url.searchParams.set('cheia', '1');
   }
   return url.toString();
 }
 
 async function abrirNoSite() {
-  const origem = roomTokens && origemDoSite();
+  const origem = estado.roomTokens && origemDoSite();
   if (!origem) return;
   const url = urlDoSite(origem);
 
@@ -2098,7 +2040,7 @@ function stopMyBroadcast(fonte = null) {
     myBroadcast?.stop();
     myBroadcast = null;
   }
-  if (participants.some((p) => p.broadcasting && p.id === sessao.atual?.user?.id)) {
+  if (estado.participants.some((p) => p.broadcasting && p.id === sessao.atual?.user?.id)) {
     // Sem fonte o servidor derruba tudo — que é o certo para sair da sala.
     ws?.send(JSON.stringify({ type: 'stop-broadcast', ...(fonte ? { fonte } : {}) }));
   }
@@ -2107,7 +2049,7 @@ function stopMyBroadcast(fonte = null) {
 $('share').addEventListener('click', () => {
   if (!sessao.atual) return;
 
-  if (minhasFontes().has('tela') || myBroadcast) {
+  if (estado.minhasFontes(sessao.atual?.user?.id).has('tela') || myBroadcast) {
     stopMyBroadcast('tela');
     renderBar();
     return;
@@ -2119,7 +2061,7 @@ $('share').addEventListener('click', () => {
 $('camera').addEventListener('click', () => {
   if (!sessao.atual) return;
 
-  if (minhasFontes().has('camera')) {
+  if (estado.minhasFontes(sessao.atual?.user?.id).has('camera')) {
     stopMyBroadcast('camera');
     renderBar();
     return;
@@ -2147,7 +2089,7 @@ function setVolume(valor) {
   if (volume > 0) volumeAntes = volume;
   store('volume', String(volume));
   // O geral mudou: cada stream recalcula, porque o dele é o produto dos dois.
-  for (const slot of streams.keys()) aplicarVolume(slot);
+  for (const slot of estado.streams.keys()) aplicarVolume(slot);
   renderVolume();
 }
 
@@ -2170,8 +2112,8 @@ $('volume').addEventListener('input', (e) => setVolume(Number(e.target.value) / 
 async function broadcastFromHere() {
   if (!navigator.mediaDevices?.getDisplayMedia || !window.VideoEncoder) return false;
 
-  if (!roomTokens) return false;
-  const shareToken = new URL(roomTokens.shareUrl).searchParams.get('t');
+  if (!estado.roomTokens) return false;
+  const shareToken = new URL(estado.roomTokens.shareUrl).searchParams.get('t');
   if (!shareToken) return false;
 
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
@@ -2277,12 +2219,12 @@ $('roomPass').addEventListener('keydown', (e) => {
 
 $('roomSave').addEventListener('click', async () => {
   // A sala pode ter fechado com o modal aberto; sem ela não há o que salvar.
-  if ($('roomSave').disabled || !roomTokens) return;
+  if ($('roomSave').disabled || !estado.roomTokens) return;
   $('roomSave').disabled = true;
   try {
     const r = await post(`${P}/api/rooms/password`, {
       identity: sessao.atual.identity,
-      roomId: roomTokens.roomId,
+      roomId: estado.roomTokens.roomId,
       password: $('roomPass').value || '',
     });
     $('roomModal').hidden = true;
@@ -2295,7 +2237,7 @@ $('roomSave').addEventListener('click', async () => {
 });
 
 function openRoomSettings() {
-  $('roomSub').textContent = roomInfo?.name ?? '';
+  $('roomSub').textContent = estado.roomInfo?.name ?? '';
   $('roomPass').value = '';
   $('roomModal').hidden = false;
   $('roomPass').focus();
@@ -2343,8 +2285,8 @@ acordarBarras();
 // O estado visual do botão é decidido por renderGrid, que é quem sabe se há
 // tela no palco — aqui só se troca a intenção.
 $('fullscreen').addEventListener('click', () => {
-  if (activeSlot === null) return;
-  telaCheia = !telaCheia;
+  if (estado.activeSlot === null) return;
+  estado.telaCheia = !estado.telaCheia;
   renderGrid();
 });
 
@@ -2360,8 +2302,8 @@ window.addEventListener('keydown', (e) => {
   }
 
   // Esc sai da tela cheia — é o reflexo de todo mundo.
-  if (telaCheia) {
-    telaCheia = false;
+  if (estado.telaCheia) {
+    estado.telaCheia = false;
     renderGrid();
   }
 });
