@@ -5,6 +5,7 @@ import { destinoDaQueda } from './reconexao.js';
 import { createArmazenamento } from './armazenamento.js';
 import { createAvisos } from './avisos.js';
 import { createApi } from './api.js';
+import { createSessao } from './sessao.js';
 import { createBroadcaster } from '../../shared/broadcaster.js';
 import {
   iceServers,
@@ -25,12 +26,25 @@ const inDiscord = params.has('frame_id');
 // Dentro da Activity todo tráfego precisa passar pelo proxy do Discord.
 const P = inDiscord ? '/.proxy' : '';
 
-const { read, store, remove } = createArmazenamento();
+const armazenamento = createArmazenamento();
+const { read, store, remove } = armazenamento;
 const { toast, setEmpty } = createAvisos({ porId: $ });
-// A renovação ainda mora aqui; o thunk só a procura na hora de um 401.
+// A api precisa da sessão para renovar, e a sessão da api para entrar: o
+// thunk desfaz o círculo, porque só procura a sessão na hora de um 401.
 const { post, loadConfig } = createApi({
   base: P,
-  renovarIdentidade: () => renovarIdentidade(),
+  renovarIdentidade: () => sessao.renovar(),
+});
+const sessao = createSessao({
+  inDiscord,
+  params,
+  base: P,
+  api: { post },
+  armazenamento,
+  // Thunks: storedName e renderProfileButton são definidos mais abaixo.
+  nomeGuardado: () => storedName(),
+  aoRenovar: () => renderProfileButton(),
+  criarSdk: (id) => new DiscordSDK(id),
 });
 
 // Um decoder e um canvas por transmissor, indexados pelo slot que o servidor
@@ -49,9 +63,6 @@ const watching = new Set(); // slots que eu pedi para assistir
 // falar com a aba existente e abrir outra.
 const abas = new Set();
 
-let sdk = null;
-let session = null;
-let clientId = null;
 let ws = null;
 let participants = [];
 let reconnectDelay = 1000;
@@ -471,7 +482,7 @@ function buildTile(p, { palco = false, semVideo = false, slot: slotDado = null }
   // `semVideo` quer só o avatar, e aí não há slot para acertar.
   const slot = p.broadcasting && !semVideo ? slotDado : null;
   const stream = slot !== null ? streams.get(slot) : null;
-  const isMe = p.id === session?.user?.id;
+  const isMe = p.id === sessao.atual?.user?.id;
 
   const tile = document.createElement('div');
   tile.className = p.broadcasting ? 'tile sharing' : 'tile';
@@ -659,25 +670,25 @@ function buildWatchPrompt(slot, name, isMe) {
 // -------------------------------------------------------------------- perfil
 
 function renderProfileButton() {
-  if (!session) return;
-  const me = participants.find((p) => p.id === session.user.id) ?? session.user;
+  if (!sessao.atual) return;
+  const me = participants.find((p) => p.id === sessao.atual.user.id) ?? sessao.atual.user;
 
   // A identidade vive só no cabeçalho do lobby agora: bolinha com nome.
   const name = document.createElement('span');
   name.textContent = me.name;
-  $('lobbyUser').replaceChildren(buildAvatar({ ...me, id: session.user.id }), name);
+  $('lobbyUser').replaceChildren(buildAvatar({ ...me, id: sessao.atual.user.id }), name);
   $('lobbyUser').hidden = false;
 }
 
 $('lobbyUser').addEventListener('click', openProfile);
 
 function openProfile() {
-  if (!session) return;
-  const me = participants.find((p) => p.id === session.user.id) ?? session.user;
+  if (!sessao.atual) return;
+  const me = participants.find((p) => p.id === sessao.atual.user.id) ?? sessao.atual.user;
 
-  $('profileAvatar').replaceChildren(buildAvatar({ ...me, id: session.user.id }));
+  $('profileAvatar').replaceChildren(buildAvatar({ ...me, id: sessao.atual.user.id }));
   $('profileName').textContent = me.name;
-  $('profileId').textContent = inDiscord ? `Discord · ${session.user.id}` : 'modo local';
+  $('profileId').textContent = inDiscord ? `Discord · ${sessao.atual.user.id}` : 'modo local';
   $('profileInput').value = me.name;
 
   $('profileModal').hidden = false;
@@ -702,7 +713,7 @@ $('profileInput').addEventListener('keydown', (e) => {
 $('profileSave').addEventListener('click', () => {
   const name = $('profileInput').value.replace(/\s+/g, ' ').trim().slice(0, 32);
   if (name) {
-    session.user.name = name;
+    sessao.atual.user.name = name;
     storeName(name);
     ws?.send(JSON.stringify({ type: 'rename', name }));
     renderProfileButton();
@@ -860,7 +871,9 @@ function buildPeopleList() {
       row.append(dot);
     }
     // textContent, nunca innerHTML: nome vem do Discord, é conteúdo de terceiro.
-    row.append(document.createTextNode(p.id === session?.user?.id ? `${p.name} (você)` : p.name));
+    row.append(
+      document.createTextNode(p.id === sessao.atual?.user?.id ? `${p.name} (você)` : p.name),
+    );
     list.append(row);
   }
 
@@ -1271,9 +1284,8 @@ async function boot() {
 
   // Sem login o lobby ainda abre: dá para ver as salas antes de entrar. Só
   // criar e entrar é que pedem identidade.
-  session = inDiscord ? await authDiscord(config) : await authWeb();
+  await sessao.entrar(config);
 
-  clientId = params.get('client_id') || (await config).clientId || null;
   checkVersion((await config).asset);
   clearTimeout(vigia);
 
@@ -1292,7 +1304,7 @@ async function boot() {
 
   await showLobby();
   if (ingresso) return abrirPeloIngresso(ingresso);
-  if (session && alvo) await joinById(alvo);
+  if (sessao.atual && alvo) await joinById(alvo);
 }
 
 /**
@@ -1340,7 +1352,8 @@ async function entrarNaCall() {
     // ao /api/rooms/call fica para quem chegou aqui sem ela: identidade
     // reaproveitada de uma visita anterior, ou servidor mais antigo.
     const tokens =
-      session?.sala ?? (await post(`${P}/api/rooms/call`, { identity: session.identity }));
+      sessao.atual?.sala ??
+      (await post(`${P}/api/rooms/call`, { identity: sessao.atual.identity }));
     openRoom(tokens, { id: tokens.roomId, name: 'Sala da call' });
   } catch (err) {
     setEmpty('Não foi possível entrar', err.message);
@@ -1355,58 +1368,6 @@ $('loginBtn').addEventListener('click', () => {
   remove('identity');
   location.href = '/auth/login';
 });
-
-/**
- * Identidade fora do Discord.
- *
- * O callback do OAuth devolve o token no fragmento da URL — que não é enviado
- * ao servidor nem entra em log de proxy. Lemos, guardamos e limpamos a barra
- * de endereço para o token não ficar visível nem no histórico.
- */
-async function authWeb() {
-  const fragment = new URLSearchParams(location.hash.slice(1));
-  const fromLogin = fragment.get('identity');
-
-  if (fromLogin) {
-    store('identity', fromLogin);
-    history.replaceState(null, '', location.pathname + location.search);
-  }
-
-  let identity = fromLogin ?? read('identity');
-
-  // Sem identidade nenhuma: entra como convidado. O login do Discord é uma
-  // melhoria opcional, não um pedágio para assistir uma tela.
-  if (!identity) {
-    const guest = await post('/api/session-guest', { name: storedName() }, { retry: false });
-    store('identity', guest.identity);
-    identity = guest.identity;
-  }
-
-  const payload = decodeIdentity(identity);
-  if (!payload) {
-    remove('identity');
-    return null;
-  }
-
-  return {
-    identity,
-    isGuest: String(payload.uid).startsWith('guest-'),
-    call: payload.call ?? null,
-    user: { id: payload.uid, name: payload.name, avatar: payload.av ?? null },
-  };
-}
-
-function decodeIdentity(token) {
-  try {
-    const p = JSON.parse(atob(token.split('.')[0].replace(/-/g, '+').replace(/_/g, '/')));
-    // O servidor revalida a assinatura; aqui só descartamos o que já venceu,
-    // para não tentar usar um token morto e cair num erro sem explicação.
-    if (p.exp && p.exp * 1000 < Date.now()) return null;
-    return p;
-  } catch {
-    return null;
-  }
-}
 
 // -------------------------------------------------------------------- lobby
 
@@ -1476,7 +1437,7 @@ async function showLobby() {
 
   // O login só aparece para convidado: quem já entrou pelo Discord não tem o
   // que melhorar.
-  $('loginBtn').hidden = inDiscord || !session?.isGuest;
+  $('loginBtn').hidden = inDiscord || !sessao.atual?.isGuest;
   $('people').hidden = true;
 
   await loadRooms();
@@ -1495,7 +1456,7 @@ async function loadRooms() {
 
   let rooms;
   try {
-    rooms = (await post(`${P}/api/rooms/list`, { identity: session?.identity })).rooms ?? [];
+    rooms = (await post(`${P}/api/rooms/list`, { identity: sessao.atual?.identity })).rooms ?? [];
   } catch (err) {
     list.replaceChildren(msgRow(`Não foi possível carregar: ${err.message}`));
     return;
@@ -1560,11 +1521,11 @@ function roomCard(room) {
 }
 
 async function enterRoom(room, password) {
-  if (!session) return;
+  if (!sessao.atual) return;
 
   try {
     const tokens = await post(`${P}/api/rooms/join`, {
-      identity: session.identity,
+      identity: sessao.atual.identity,
       roomId: room.id,
       password: password ?? '',
     });
@@ -1707,76 +1668,6 @@ function checkVersion(asset) {
   location.reload();
 }
 
-/**
- * @param {Promise<{clientId?:string}>|string} fonteDoId promessa da config, ou
- * o id direto quando já se sabe qual é (o caminho da renovação de sessão).
- */
-async function authDiscord(fonteDoId) {
-  // O Discord injeta client_id na URL do iframe. Preferir essa via tira o login
-  // da dependência de uma ida ao servidor: quando ela demorava, a atividade
-  // ficava parada sem nada para mostrar. A config entra só como reserva.
-  const id =
-    params.get('client_id') ||
-    (typeof fonteDoId === 'string' ? fonteDoId : (await fonteDoId)?.clientId);
-
-  if (!id) {
-    throw new Error('O servidor está sem as credenciais do Discord. Rode: npm run configurar');
-  }
-
-  const clientId = id;
-  sdk = new DiscordSDK(clientId);
-  await sdk.ready();
-
-  const { code } = await sdk.commands.authorize({
-    client_id: clientId,
-    response_type: 'code',
-    state: '',
-    prompt: 'none',
-    // Só precisamos de /users/@me. Menos escopo, menos atrito no consentimento.
-    scope: ['identify'],
-  });
-
-  const { access_token } = await post(`${P}/api/token`, { code, client_id: clientId });
-
-  // Em paralelo, e não em fila: o authenticate avisa o cliente do Discord, o
-  // /api/session consulta o Discord pelo nosso servidor, e nenhum dos dois
-  // depende do resultado do outro. Em série eram duas esperas somadas.
-  //
-  // guild/channel vão junto para o servidor poder confirmar, pelo Discord, que
-  // a pessoa está mesmo naquela call.
-  const [, sessao] = await Promise.all([
-    sdk.commands.authenticate({ access_token }),
-    post(`${P}/api/session`, {
-      access_token,
-      instance_id: sdk.instanceId,
-      guild_id: sdk.guildId,
-      channel_id: sdk.channelId,
-    }),
-  ]);
-
-  return sessao;
-}
-
-/**
- * Emite uma identidade nova, jogando fora a que o servidor recusou.
- *
- * O crachá vive no localStorage e vale até o servidor trocar o segredo que o
- * assina. Quando isso acontece — reinstalação, mudança de máquina, rotação de
- * segredo —, todo crachá guardado vira inválido de uma vez. Sem isto o cliente
- * insistia no mesmo token para sempre e a pessoa ficava presa em "sessão
- * inválida", sem nada na interface que resolvesse.
- */
-async function renovarIdentidade() {
-  remove('identity');
-  try {
-    session = inDiscord ? await authDiscord(clientId) : await authWeb();
-    renderProfileButton();
-    return session?.identity ?? null;
-  } catch {
-    return null;
-  }
-}
-
 // ----------------------------------------------------------------- websocket
 
 function connect() {
@@ -1805,8 +1696,8 @@ function connect() {
     // O apelido é do cliente, então precisa ser reenviado a cada conexão —
     // inclusive nas reconexões, senão o nome volta ao do Discord sozinho.
     const saved = storedName();
-    if (saved && saved !== session.user.name) {
-      session.user.name = saved;
+    if (saved && saved !== sessao.atual.user.name) {
+      sessao.atual.user.name = saved;
       ws.send(JSON.stringify({ type: 'rename', name: saved }));
     }
   });
@@ -1843,7 +1734,7 @@ function connect() {
       // A senha da sala só aparece para quem a criou.
       $('roomPill').textContent =
         `${lastRoomState?.locked ? '🔒 ' : ''}${lastRoomState?.name ?? ''}`;
-      $('roomSettings').hidden = lastRoomState?.ownerId !== session?.user?.id;
+      $('roomSettings').hidden = lastRoomState?.ownerId !== sessao.atual?.user?.id;
       $('roomSettings').classList.toggle('on', Boolean(lastRoomState?.locked));
 
       // Limpa o que sumiu sem stream-stop (queda abrupta, por exemplo).
@@ -1987,7 +1878,7 @@ async function conferirIngresso(tokens) {
  */
 /** As fontes que eu estou transmitindo agora, segundo o servidor. */
 function minhasFontes() {
-  const meu = session?.user?.id;
+  const meu = sessao.atual?.user?.id;
   if (!meu) return new Set();
   return new Set(slotsOf(meu).map((slot) => available.get(slot)?.fonte ?? 'tela'));
 }
@@ -2001,7 +1892,7 @@ function minhasFontes() {
  * abria outra em cima dela.
  */
 function abaAberta() {
-  return abas.has(session?.user?.id);
+  return abas.has(sessao.atual?.user?.id);
 }
 
 /**
@@ -2120,7 +2011,7 @@ async function abrirLink(fonte) {
 
   if (inDiscord) {
     try {
-      const res = await sdk.commands.openExternalLink({ url });
+      const res = await sessao.sdk.commands.openExternalLink({ url });
       // Clientes antigos devolvem null; só tratamos false como recusa explícita.
       if (res?.opened === false) {
         toast('Você recusou abrir o link. Sem isso não dá para capturar a tela.', true);
@@ -2182,7 +2073,7 @@ async function abrirNoSite() {
   }
 
   try {
-    const res = await sdk.commands.openExternalLink({ url });
+    const res = await sessao.sdk.commands.openExternalLink({ url });
     // Clientes antigos devolvem null; só false é recusa explícita.
     if (res?.opened === false) toast('Você recusou abrir o link.', true);
   } catch (err) {
@@ -2207,14 +2098,14 @@ function stopMyBroadcast(fonte = null) {
     myBroadcast?.stop();
     myBroadcast = null;
   }
-  if (participants.some((p) => p.broadcasting && p.id === session?.user?.id)) {
+  if (participants.some((p) => p.broadcasting && p.id === sessao.atual?.user?.id)) {
     // Sem fonte o servidor derruba tudo — que é o certo para sair da sala.
     ws?.send(JSON.stringify({ type: 'stop-broadcast', ...(fonte ? { fonte } : {}) }));
   }
 }
 
 $('share').addEventListener('click', () => {
-  if (!session) return;
+  if (!sessao.atual) return;
 
   if (minhasFontes().has('tela') || myBroadcast) {
     stopMyBroadcast('tela');
@@ -2226,7 +2117,7 @@ $('share').addEventListener('click', () => {
 });
 
 $('camera').addEventListener('click', () => {
-  if (!session) return;
+  if (!sessao.atual) return;
 
   if (minhasFontes().has('camera')) {
     stopMyBroadcast('camera');
@@ -2314,7 +2205,7 @@ async function broadcastFromHere() {
 // ------------------------------------------------------- modais das salas
 
 $('newRoom').addEventListener('click', () => {
-  if (!session) return;
+  if (!sessao.atual) return;
   $('createName').value = '';
   $('createPass').value = '';
   $('createModal').hidden = false;
@@ -2342,7 +2233,7 @@ $('createGo').addEventListener('click', async () => {
 
   try {
     const tokens = await post(`${P}/api/rooms/create`, {
-      identity: session.identity,
+      identity: sessao.atual.identity,
       name,
       password: $('createPass').value || null,
     });
@@ -2350,8 +2241,8 @@ $('createGo').addEventListener('click', async () => {
     openRoom(tokens, {
       id: tokens.roomId,
       // O servidor decide o nome quando fica em branco.
-      name: name || `Sala de ${session.user.name}`,
-      owner: session.user.name,
+      name: name || `Sala de ${sessao.atual.user.name}`,
+      owner: sessao.atual.user.name,
     });
   } catch (err) {
     toast(err.message, true);
@@ -2390,7 +2281,7 @@ $('roomSave').addEventListener('click', async () => {
   $('roomSave').disabled = true;
   try {
     const r = await post(`${P}/api/rooms/password`, {
-      identity: session.identity,
+      identity: sessao.atual.identity,
       roomId: roomTokens.roomId,
       password: $('roomPass').value || '',
     });
