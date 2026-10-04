@@ -2,6 +2,7 @@ import { DiscordSDK } from '@discord/embedded-app-sdk';
 import { createPlayer } from './player.js';
 import { createAudio } from './audio.js';
 import { destinoDaQueda } from './reconexao.js';
+import { createArmazenamento } from './armazenamento.js';
 import { createBroadcaster } from '../../shared/broadcaster.js';
 import {
   iceServers,
@@ -21,6 +22,8 @@ const inDiscord = params.has('frame_id');
 
 // Dentro da Activity todo tráfego precisa passar pelo proxy do Discord.
 const P = inDiscord ? '/.proxy' : '';
+
+const { read, store, remove } = createArmazenamento();
 
 // Um decoder e um canvas por transmissor, indexados pelo slot que o servidor
 // atribuiu. Os canvas vivem fora do DOM entre renderizações e são movidos para
@@ -1409,32 +1412,6 @@ function decodeIdentity(token) {
     return p;
   } catch {
     return null;
-  }
-}
-
-// O armazenamento pode estar bloqueado num iframe de terceiro, então todo
-// acesso é protegido — perder a sessão é melhor do que a página não abrir.
-function read(key) {
-  try {
-    return localStorage.getItem(key);
-  } catch {
-    return null;
-  }
-}
-
-function store(key, value) {
-  try {
-    localStorage.setItem(key, value);
-  } catch {
-    /* sessão só em memória */
-  }
-}
-
-function remove(key) {
-  try {
-    localStorage.removeItem(key);
-  } catch {
-    /* nada a limpar */
   }
 }
 
