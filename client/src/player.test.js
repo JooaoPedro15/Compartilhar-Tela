@@ -291,6 +291,35 @@ describe('recuperação do decodificador', () => {
     expect(criados.length).toBeLessThan(10);
   });
 
+  it('config que nunca rendeu um quadro é recusa do codec, e o player diz qual', () => {
+    // O app do Discord recusou o H.264 com "Unsupported configuration" — e o
+    // nome do erro varia de navegador para navegador. O que não varia é o
+    // sintoma: nenhum quadro saiu desta config. Isso basta para pedir outra.
+    decoderQueQuebra(() => true, 'OperationError');
+    const onCodecRecusado = vi.fn();
+    const p = createPlayer(canvasFalso(), { onError: () => {}, onCodecRecusado });
+    p.start({ codec: 'avc1.640028', codedWidth: 1920, codedHeight: 1080 });
+
+    for (let i = 0; i < 5; i++) p.push(pacote(KEYFRAME, i * 33));
+
+    expect(onCodecRecusado).toHaveBeenCalledTimes(1);
+    expect(onCodecRecusado).toHaveBeenCalledWith('avc1.640028');
+  });
+
+  it('erro depois de já ter desenhado não culpa o codec', () => {
+    // Quebrar no meio é fluxo corrompido: o codec já provou que funciona aqui,
+    // e trocar de codec por isso derrubaria todo mundo para VP8 à toa.
+    let quadros = 0;
+    decoderQueQuebra(() => quadros++ > 0);
+    const onCodecRecusado = vi.fn();
+    const p = createPlayer(canvasFalso(), { onError: () => {}, onCodecRecusado });
+    p.start({ codec: 'avc1.640028', codedWidth: 1920, codedHeight: 1080 });
+
+    for (let i = 0; i < 10; i++) p.push(pacote(KEYFRAME, i * 33));
+
+    expect(onCodecRecusado).not.toHaveBeenCalled();
+  });
+
   it('avisa o primeiro quadro de novo depois de reiniciar', () => {
     // É esse aviso que tira o "Conectando…" da tela. Reiniciar acontece quando
     // a conexão direta cai e o relay volta: se o aviso não se repetir, o

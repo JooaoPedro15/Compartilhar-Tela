@@ -65,7 +65,7 @@ const PASSO_MAX_MS = 15;
  */
 const FALHAS_MAX = 3;
 
-export function createPlayer(canvas, { onError, onTamanho } = {}) {
+export function createPlayer(canvas, { onError, onTamanho, onCodecRecusado } = {}) {
   const ctx = canvas.getContext('2d', { alpha: false, desynchronized: true });
 
   let decoder = null;
@@ -74,6 +74,9 @@ export function createPlayer(canvas, { onError, onTamanho } = {}) {
   let config = null;
   let falhasSeguidas = 0;
   let desistiu = false;
+  // Se esta config já produziu algum quadro. Desistir sem nenhum é o codec sendo
+  // recusado por este navegador; desistir depois é fluxo corrompido.
+  let rendeu = false;
   let needKeyframe = true;
   let lastLagMs = 0;
   let framesDrawn = 0;
@@ -134,6 +137,7 @@ export function createPlayer(canvas, { onError, onTamanho } = {}) {
     const este = new VideoDecoder({
       output: (frame) => {
         falhasSeguidas = 0;
+        rendeu = true;
         draw(frame);
       },
       error: (err) => {
@@ -157,6 +161,19 @@ export function createPlayer(canvas, { onError, onTamanho } = {}) {
   function desistir(err) {
     desistiu = true;
     decoder = null;
+
+    // Nenhum quadro saiu desta config: é o codec que este navegador não tem — o
+    // app do Discord, por exemplo, recusa H.264. Pelo sintoma, e não pelo nome
+    // do erro, que muda de navegador para navegador. Quem transmite consegue
+    // trocar de codec; quem assiste, não.
+    if (!rendeu && onCodecRecusado) {
+      onError?.(
+        `Este aplicativo não decodifica este vídeo (${config.codec}). Pedindo outro formato a quem transmite…`,
+      );
+      onCodecRecusado(config.codec);
+      return;
+    }
+
     onError?.(
       err.name === 'NotSupportedError'
         ? `Este aplicativo não consegue decodificar o vídeo (${config.codec}). Tente assistir pelo navegador.`
@@ -351,6 +368,7 @@ export function createPlayer(canvas, { onError, onTamanho } = {}) {
     config = null;
     falhasSeguidas = 0;
     desistiu = false;
+    rendeu = false;
     needKeyframe = true;
     lastLagMs = 0;
     esvaziar();
