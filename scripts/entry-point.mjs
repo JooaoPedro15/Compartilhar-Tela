@@ -23,6 +23,8 @@ import { cor } from './env.mjs';
 const API = 'https://discord.com/api/v10';
 const PRIMARY_ENTRY_POINT = 4;
 const DISCORD_LAUNCH_ACTIVITY = 2;
+// Código do Discord para "entry point de atividade numa aplicação sem atividade".
+const ENTRY_POINT_SEM_ATIVIDADE = 50226;
 
 async function pegarToken(clientId, clientSecret) {
   const r = await fetch(`${API}/oauth2/token`, {
@@ -76,7 +78,26 @@ export async function garantirEntryPoint(clientId, clientSecret) {
       }),
     });
 
-    if (!criar.ok) throw new Error(`${criar.status} ${await criar.text()}`);
+    if (!criar.ok) {
+      const corpo = await criar.text();
+      let codigo = null;
+      try {
+        codigo = JSON.parse(corpo).code;
+      } catch {
+        /* resposta sem JSON: vai crua mesmo */
+      }
+      // 50226: a aplicação ainda não tem atividade nenhuma, porque "Enable
+      // Activities" está desligado. O `configurar` tenta isto antes de mandar
+      // a pessoa ao portal, então é o primeiro erro que quase todo mundo vê —
+      // e o texto do Discord fala de APP_HANDLER, não do botão que resolve.
+      if (codigo === ENTRY_POINT_SEM_ATIVIDADE) {
+        throw new Error(
+          'as Activities ainda estão desligadas nesta aplicação. Ligue "Enable Activities" ' +
+            'no portal (Activities → Settings); o "npm run dev" cria o atalho sozinho na próxima vez',
+        );
+      }
+      throw new Error(`${criar.status} ${corpo}`);
+    }
     return 'criado';
   } catch (err) {
     console.log(
