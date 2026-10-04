@@ -44,6 +44,11 @@ const ADMIN_IDS = new Set(
 const TEM_ADMIN = ADMIN_IDS.size > 0;
 const ADMIN_COOKIE = 'discord_screen_admin';
 
+// Prazo de toda chamada ao Discord. fetch não expira sozinho: sem isto, um
+// Discord lento segura a resposta — e quem espera é a pessoa abrindo a
+// atividade, olhando para uma tela parada.
+const PRAZO_DISCORD_MS = 8000;
+
 // Falha no arranque, não no primeiro pedido: subir sem segredo significa
 // assinar todos os tokens com o padrão público, e um servidor assim de pé é
 // pior do que um servidor que não sobe.
@@ -212,6 +217,7 @@ app.post('/api/token', async (req, res) => {
         grant_type: 'authorization_code',
         code,
       }),
+      signal: AbortSignal.timeout(PRAZO_DISCORD_MS),
     });
 
     const data = await r.json();
@@ -246,6 +252,7 @@ app.post('/api/session', async (req, res) => {
   try {
     const me = await fetch('https://discord.com/api/users/@me', {
       headers: { Authorization: `Bearer ${access_token}` },
+      signal: AbortSignal.timeout(PRAZO_DISCORD_MS),
     }).then((r) => r.json());
 
     if (!me?.id) return res.status(401).json({ error: 'token invalido' });
@@ -407,6 +414,9 @@ async function inVoiceChannel(guildId, channelId, userId) {
   try {
     const r = await fetch(`https://discord.com/api/v10/guilds/${guildId}/voice-states/${userId}`, {
       headers: { Authorization: `Bot ${DISCORD_BOT_TOKEN}` },
+      // Estourar o prazo cai no catch abaixo, que deixa entrar: a checagem
+      // existe para barrar quem está fora, não para prender quem está dentro.
+      signal: AbortSignal.timeout(PRAZO_DISCORD_MS),
     });
 
     if (r.status === 404) {
@@ -716,6 +726,7 @@ app.get('/auth/callback', async (req, res) => {
         redirect_uri: REDIRECT_URI,
         code: String(code),
       }),
+      signal: AbortSignal.timeout(PRAZO_DISCORD_MS),
     }).then((r) => r.json());
 
     if (!token.access_token) {
@@ -724,6 +735,7 @@ app.get('/auth/callback', async (req, res) => {
 
     const me = await fetch('https://discord.com/api/users/@me', {
       headers: { Authorization: `Bearer ${token.access_token}` },
+      signal: AbortSignal.timeout(PRAZO_DISCORD_MS),
     }).then((r) => r.json());
 
     if (!me?.id) {

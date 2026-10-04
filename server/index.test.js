@@ -224,6 +224,18 @@ describe('/api/session', () => {
     expect((await post('/api/session', { access_token: 'x', instance_id: 'i' })).status).toBe(401);
   });
 
+  it('a consulta do perfil leva prazo: Discord lento não segura a atividade abrindo', async () => {
+    let sinal;
+    externas.set('https://discord.com/api/users/@me', (_url, init) => {
+      sinal = init?.signal;
+      return json({ id: '123456789012345678', global_name: 'Alice' });
+    });
+
+    await post('/api/session', { access_token: 'x', instance_id: 'i' });
+
+    expect(sinal).toBeInstanceOf(AbortSignal);
+  });
+
   it('emite identidade a partir do perfil do Discord', async () => {
     externas.set('https://discord.com/api/users/@me', () =>
       json({ id: '123456789012345678', global_name: 'Alice', avatar: 'abc' }),
@@ -711,6 +723,23 @@ describe('login pelo site', () => {
     });
 
     expect((await get('/auth/callback?code=abc')).headers.get('location')).toBe('/?erro=interno');
+  });
+
+  it('as chamadas ao Discord levam prazo, para um Discord lento não prender o login', async () => {
+    const sinais = [];
+    externas.set('https://discord.com/api/oauth2/token', (_url, init) => {
+      sinais.push(init?.signal);
+      return json({ access_token: 'tok' });
+    });
+    externas.set('https://discord.com/api/users/@me', (_url, init) => {
+      sinais.push(init?.signal);
+      return json({ id: '123456789012345678', global_name: 'Alice' });
+    });
+
+    await get('/auth/callback?code=abc');
+
+    expect(sinais).toHaveLength(2);
+    for (const sinal of sinais) expect(sinal).toBeInstanceOf(AbortSignal);
   });
 });
 

@@ -118,6 +118,18 @@ describe('/api/token', () => {
 
     expect((await post('/api/token', { code: 'abc' })).status).toBe(500);
   });
+
+  it('a troca leva prazo, para um Discord lento não prender o arranque', async () => {
+    let sinal;
+    finge('https://discord.com/api/oauth2/token', (_url, init) => {
+      sinal = init?.signal;
+      return json({ access_token: 'tok' });
+    });
+
+    await post('/api/token', { code: 'abc' });
+
+    expect(sinal).toBeInstanceOf(AbortSignal);
+  });
 });
 
 describe('presença na call, confirmada pelo bot', () => {
@@ -137,6 +149,18 @@ describe('presença na call, confirmada pelo bot', () => {
       guild_id: guild,
       channel_id: channel,
     });
+
+  it('a consulta de voz leva prazo: era a única chamada ao Discord sem ele', async () => {
+    let sinal;
+    comVoz((_url, init) => {
+      sinal = init?.signal;
+      return json({ channel_id: CANAL });
+    });
+
+    await abrir();
+
+    expect(sinal).toBeInstanceOf(AbortSignal);
+  });
 
   it('carimba a call no token quando o Discord confirma', async () => {
     comVoz(() => json({ channel_id: CANAL }));
