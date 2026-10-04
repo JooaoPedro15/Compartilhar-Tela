@@ -921,6 +921,14 @@ function openStream(slot, userId) {
         s.started = true;
         renderGrid();
       },
+      // Este navegador não decodifica o codec da transmissão — o app do
+      // Discord recusa H.264. Quem transmite troca de codec, a config nova
+      // chega, e o startStream dela tira a falha da tela.
+      onCodecRecusado: (codec) => {
+        if (ws?.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: 'codec-recusado', slot, codec }));
+        }
+      },
     }),
     // Só nasce quando a transmissão anuncia que tem som — nem toda tem.
     audio: null,
