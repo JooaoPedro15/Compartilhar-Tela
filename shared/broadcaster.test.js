@@ -1451,3 +1451,75 @@ describe('sem MediaStreamTrackProcessor', () => {
     expect(document.querySelector('video')).toBeNull();
   });
 });
+
+describe('codec recusado por quem assiste', () => {
+  // Explícito em cada teste: `mockClear` no beforeEach não desfaz a
+  // implementação que um teste anterior deixou.
+  const h264EVp8 = async (config) => ({
+    supported: (config.codec.startsWith('avc1.') && Boolean(config.avc)) || config.codec === 'vp8',
+  });
+
+  it('troca para o próximo codec quando alguém não decodifica o atual', async () => {
+    // O caso real: o Chrome escolhe H.264 (hardware), e o app do Discord não
+    // decodifica H.264. Sem a troca, quem assiste pelo Discord não vê nada.
+    VideoEncoderFalso.isConfigSupported.mockImplementation(h264EVp8);
+    const onAviso = vi.fn();
+    const { ws, encoder } = await noAr({ onAviso });
+    expect(encoder.configuracoes[0].codec).toBe(H264);
+
+    ws.receber({ type: 'codec-recusado', codec: H264 });
+    await respirar();
+
+    expect(encoder.configuracoes.at(-1).codec).toBe('vp8');
+    expect(onAviso).toHaveBeenCalledWith(expect.stringContaining('vp8'));
+  });
+
+  it('o próximo quadro sai como keyframe, para quem assiste montar o decoder novo', async () => {
+    VideoEncoderFalso.isConfigSupported.mockImplementation(h264EVp8);
+    const { ws, encoder, stream } = await noAr();
+    const track = stream.getVideoTracks()[0];
+    processadorDe(track).empurrar(quadro());
+    await respirar();
+    encoder.codificados.length = 0;
+
+    ws.receber({ type: 'codec-recusado', codec: H264 });
+    await respirar();
+    processadorDe(track).empurrar(quadro());
+    await respirar();
+
+    expect(encoder.codificados.at(-1).opcoes.keyFrame).toBe(true);
+  });
+
+  it('recado sobre um codec que não é o atual não mexe em nada', async () => {
+    // Dois espectadores recusando o mesmo H.264: o segundo recado chega depois
+    // da troca, e não pode derrubar o VP8 que acabou de entrar.
+    VideoEncoderFalso.isConfigSupported.mockImplementation(h264EVp8);
+    const { ws, encoder } = await noAr();
+    ws.receber({ type: 'codec-recusado', codec: H264 });
+    await respirar();
+    const configuracoes = encoder.configuracoes.length;
+
+    ws.receber({ type: 'codec-recusado', codec: H264 });
+    ws.receber({ type: 'codec-recusado', codec: 'vp09.00.10.08' });
+    await respirar();
+
+    expect(encoder.configuracoes).toHaveLength(configuracoes);
+  });
+
+  it('sem codec que sobre, avisa e segue no atual em vez de parar a transmissão', async () => {
+    // Só H.264 disponível aqui: trocar é impossível, mas quem consegue ver
+    // continua vendo — parar tiraria a tela de todo mundo por causa de um.
+    VideoEncoderFalso.isConfigSupported.mockImplementation(async (config) => ({
+      supported: config.codec.startsWith('avc1.') && Boolean(config.avc),
+    }));
+    const onAviso = vi.fn();
+    const { b, ws, encoder } = await noAr({ onAviso });
+
+    ws.receber({ type: 'codec-recusado', codec: H264 });
+    await respirar();
+
+    expect(encoder.configuracoes.at(-1).codec).toBe(H264);
+    expect(b.isRunning()).toBe(true);
+    expect(onAviso).toHaveBeenCalledWith(expect.stringMatching(/nenhum outro codec/i));
+  });
+});

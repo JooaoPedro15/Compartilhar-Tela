@@ -77,13 +77,24 @@ function comNivel(codec, nivel) {
  * saída para quem não tem H.264 nenhum. `annexb` vem antes de cada perfil
  * porque dispensa o blob `description`, e o avcC é aceito onde annexb não é.
  */
-function candidatos(width, height, fps) {
+function candidatos(width, height, fps, recusadas = new Set()) {
   const nivel = nivelH264(width, height, fps).toString(16).padStart(2, '0');
   const h264 = PERFIS_H264.flatMap((perfil) => {
     const codec = `avc1.${perfil}${nivel}`;
     return [{ codec, avc: { format: 'annexb' } }, { codec }];
   });
-  return [...h264, { codec: 'vp8' }, { codec: 'vp09.00.10.08' }];
+  return [...h264, { codec: 'vp8' }, { codec: 'vp09.00.10.08' }].filter(
+    (c) => !recusadas.has(familiaDoCodec(c.codec)),
+  );
+}
+
+/**
+ * A família de um nome de codec: "avc1.640028" é H.264 ("avc1"), qualquer que
+ * seja o perfil e o nível. É a família que quem assiste recusa — o app do
+ * Discord não decodifica H.264 nenhum, e trocar só o nível não resolveria.
+ */
+export function familiaDoCodec(codec) {
+  return typeof codec === 'string' ? codec.split('.')[0].toLowerCase() : null;
 }
 
 /**
@@ -268,6 +279,9 @@ export function createBroadcaster({
   // Antes do primeiro config, pausar deixaria quem chegasse depois sem como
   // montar o decodificador: o servidor guarda o config, mas só depois de vê-lo.
   let configEnviada = false;
+  // Famílias de codec que alguém assistindo não conseguiu decodificar. Saem da
+  // lista de candidatos até o fim desta transmissão.
+  const codecsRecusados = new Set();
 
   let running = false;
   let mySlot = 0;
@@ -660,7 +674,7 @@ export function createBroadcaster({
     // troca de cena ele estoura o alvo com folga, e a rajada é justamente o que
     // entope o relay. Constante troca qualidade em cena difícil por um teto que
     // se cumpre.
-    for (const candidate of candidatos(width, height, fps)) {
+    for (const candidate of candidatos(width, height, fps, codecsRecusados)) {
       for (const realtime of [true, false]) {
         for (const constante of [true, false]) {
           const cfg = { ...candidate, width, height, bitrate, framerate: fps };
@@ -990,6 +1004,8 @@ export function createBroadcaster({
         // Ninguém mais depende do relay para esta transmissão (ou voltou a
         // depender). Ver a nota em encodeFrame.
         else if (msg.type === 'chunks') enviarChunks = msg.on !== false;
+        // Alguém não decodifica o codec atual. Ver a nota em trocarCodec.
+        else if (msg.type === 'codec-recusado') trocarCodec(msg.codec);
         else if (msg.type === 'stop-request')
           stop(msg.motivo ?? 'Transmissão encerrada pela atividade.');
         else if (msg.type === 'error') {
@@ -1168,6 +1184,59 @@ export function createBroadcaster({
     if (novoAudio) await trocarNosPeers(novoAudio);
 
     return fresh;
+  }
+
+  /**
+   * Alguém assistindo não decodifica o codec atual: troca para o próximo.
+   *
+   * O codec é escolhido aqui olhando só para o encoder deste navegador, e quem
+   * assiste pode não ter o decodificador — o app do Discord recusa H.264, que
+   * é justamente o que o Chrome prefere. Quem assiste não tem como trocar;
+   * daqui dá. A troca vale para todo mundo, porque o fluxo é um só, e o
+   * keyframe seguinte já sai no codec novo, com a config nova na frente.
+   *
+   * Sem codec que sobre, a transmissão segue no atual: quem consegue ver
+   * continua vendo, e parar tiraria a tela de todos por causa de um.
+   */
+  async function trocarCodec(recusado) {
+    const familia = familiaDoCodec(recusado);
+    // Recado repetido, ou sobre um codec que já saiu de cena: nada a trocar.
+    if (!familia || codecsRecusados.has(familia) || familiaDoCodec(config?.codec) !== familia) {
+      return;
+    }
+    codecsRecusados.add(familia);
+    if (encoder?.state !== 'configured') return;
+
+    const novo = await pickConfig(config.width, config.height);
+    // A transmissão pode ter acabado enquanto o navegador respondia.
+    if (!running || encoder?.state !== 'configured') return;
+    if (!novo) {
+      onAviso?.(
+        'Alguém não consegue ver esta transmissão, e este navegador não gera nenhum outro codec.',
+      );
+      return;
+    }
+
+    const anterior = config;
+    config = novo;
+    try {
+      encoder.configure(config);
+    } catch (err) {
+      console.warn('[encoder] troca de codec recusada:', err.message);
+      config = anterior;
+      return;
+    }
+    wantKeyframe = true;
+
+    onStatus?.({
+      codec: config.codec,
+      width: config.width,
+      height: config.height,
+      direct: Boolean(window.MediaStreamTrackProcessor),
+    });
+    onAviso?.(
+      `Alguém não conseguia ver em ${familia.toUpperCase()}: a transmissão passou para ${config.codec}.`,
+    );
   }
 
   /** Ajusta qualidade e taxa de quadros com a transmissão no ar. */
