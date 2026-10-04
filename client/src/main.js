@@ -4,6 +4,7 @@ import { createAudio } from './audio.js';
 import { destinoDaQueda } from './reconexao.js';
 import { createArmazenamento } from './armazenamento.js';
 import { createAvisos } from './avisos.js';
+import { createApi } from './api.js';
 import { createBroadcaster } from '../../shared/broadcaster.js';
 import {
   iceServers,
@@ -26,6 +27,11 @@ const P = inDiscord ? '/.proxy' : '';
 
 const { read, store, remove } = createArmazenamento();
 const { toast, setEmpty } = createAvisos({ porId: $ });
+// A renovação ainda mora aqui; o thunk só a procura na hora de um 401.
+const { post, loadConfig } = createApi({
+  base: P,
+  renovarIdentidade: () => renovarIdentidade(),
+});
 
 // Um decoder e um canvas por transmissor, indexados pelo slot que o servidor
 // atribuiu. Os canvas vivem fora do DOM entre renderizações e são movidos para
@@ -1652,22 +1658,6 @@ function openRoom(tokens, room) {
 // A limpeza toda — inclusive parar de transmitir — vive em showLobby.
 $('leaveRoom').addEventListener('click', () => showLobby());
 
-/** Client id e versão do bundle, decididos pelo servidor. */
-async function loadConfig() {
-  try {
-    const r = await fetch(`${P}/api/config`, {
-      cache: 'no-store',
-      // fetch não expira sozinho. Sem prazo, um pedido que trava segura tudo o
-      // que vem depois — e nada aqui vale prender o arranque.
-      signal: AbortSignal.timeout(6000),
-    });
-    return await r.json();
-  } catch {
-    // Nem o id nem o diagnóstico podem impedir a sala de abrir.
-    return {};
-  }
-}
-
 /**
  * Detecta bundle velho e recarrega.
  *
@@ -1785,50 +1775,6 @@ async function renovarIdentidade() {
   } catch {
     return null;
   }
-}
-
-/**
- * `retry` existe para a chamada que renova a identidade não cair nela mesma:
- * um 401 ali significa que renovar não resolve, e insistir viraria laço.
- */
-async function post(url, body, { retry = true } = {}) {
-  let r;
-  try {
-    r = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-      // Um pedido pendurado é pior que um pedido que falha: o que falha diz
-      // alguma coisa, o pendurado só deixa a tela parada.
-      signal: AbortSignal.timeout(15_000),
-    });
-  } catch (err) {
-    const msg =
-      err.name === 'TimeoutError'
-        ? 'O servidor não respondeu a tempo.'
-        : 'Não foi possível falar com o servidor.';
-    throw Object.assign(new Error(msg), { status: 0 });
-  }
-
-  const data = await r.json().catch(() => ({}));
-
-  if (!r.ok) {
-    // 401 numa chamada que levava identidade quer dizer crachá morto, não falta
-    // de permissão: renova uma vez e repete, em vez de devolver um erro que a
-    // pessoa não tem como resolver.
-    if (r.status === 401 && retry && body?.identity) {
-      const nova = await renovarIdentidade();
-      if (nova) return post(url, { ...body, identity: nova }, { retry: false });
-    }
-
-    // O status carrega significado (403 = senha, 429 = bloqueio, 404 = sala
-    // fechou), então vai junto do erro em vez de virar texto.
-    const err = new Error(data.error ?? `Servidor respondeu ${r.status}.`);
-    err.status = r.status;
-    err.detail = data.error;
-    throw err;
-  }
-  return data;
 }
 
 // ----------------------------------------------------------------- websocket
