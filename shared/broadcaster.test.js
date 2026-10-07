@@ -1523,3 +1523,64 @@ describe('codec recusado por quem assiste', () => {
     expect(onAviso).toHaveBeenCalledWith(expect.stringMatching(/nenhum outro codec/i));
   });
 });
+
+describe('codec por hardware antes do codec pela CPU', () => {
+  /** H.264 sempre; AV1 e VP9 só quando pedidos por hardware e `comHardware`. */
+  const navegador =
+    ({ av1 = false, vp9 = false } = {}) =>
+    async (config) => {
+      const hw = config.hardwareAcceleration === 'prefer-hardware';
+      const familia = config.codec.split('.')[0];
+      if (familia === 'avc1') return { supported: Boolean(config.avc) };
+      if (familia === 'av01') return { supported: av1 && hw };
+      if (familia === 'vp09') return { supported: hw ? vp9 : true };
+      return { supported: familia === 'vp8' };
+    };
+
+  it('com o H.264 recusado, prefere AV1 pela placa de vídeo ao VP8 pela CPU', async () => {
+    VideoEncoderFalso.isConfigSupported.mockImplementation(navegador({ av1: true }));
+    const { ws, encoder } = await noAr();
+
+    ws.receber({ type: 'codec-recusado', codec: H264 });
+    await respirar();
+
+    expect(encoder.configuracoes.at(-1)).toMatchObject({ hardwareAcceleration: 'prefer-hardware' });
+    expect(encoder.configuracoes.at(-1).codec).toMatch(/^av01\./);
+  });
+
+  it('sem AV1 por hardware, tenta VP9 por hardware', async () => {
+    VideoEncoderFalso.isConfigSupported.mockImplementation(navegador({ vp9: true }));
+    const { ws, encoder } = await noAr();
+
+    ws.receber({ type: 'codec-recusado', codec: H264 });
+    await respirar();
+
+    expect(encoder.configuracoes.at(-1)).toMatchObject({
+      codec: 'vp09.00.10.08',
+      hardwareAcceleration: 'prefer-hardware',
+    });
+  });
+
+  it('sem nenhum por hardware, cai no VP8 como antes', async () => {
+    VideoEncoderFalso.isConfigSupported.mockImplementation(navegador());
+    const { ws, encoder } = await noAr();
+
+    ws.receber({ type: 'codec-recusado', codec: H264 });
+    await respirar();
+
+    expect(encoder.configuracoes.at(-1).codec).toBe('vp8');
+  });
+
+  it('AV1 recusado também por quem assiste segue para o próximo da fila', async () => {
+    VideoEncoderFalso.isConfigSupported.mockImplementation(navegador({ av1: true, vp9: true }));
+    const { ws, encoder } = await noAr();
+    ws.receber({ type: 'codec-recusado', codec: H264 });
+    await respirar();
+    const av1 = encoder.configuracoes.at(-1).codec;
+
+    ws.receber({ type: 'codec-recusado', codec: av1 });
+    await respirar();
+
+    expect(encoder.configuracoes.at(-1).codec).toBe('vp09.00.10.08');
+  });
+});

@@ -83,7 +83,16 @@ function candidatos(width, height, fps, recusadas = new Set()) {
     const codec = `avc1.${perfil}${nivel}`;
     return [{ codec, avc: { format: 'annexb' } }, { codec }];
   });
-  return [...h264, { codec: 'vp8' }, { codec: 'vp09.00.10.08' }].filter(
+  // Depois do H.264, os codecs livres pela placa de vídeo: é para eles que se
+  // cai quando quem assiste não decodifica H.264 — o app do Discord, por
+  // exemplo. Só por hardware: AV1 pela CPU é pesado demais para tempo real, e
+  // VP9 pela CPU já tem lugar no fim da fila. O VP8 vem depois deles porque roda
+  // na CPU em qualquer máquina, e numa máquina fraca 1080p pela CPU trava.
+  const porHardware = [
+    { codec: `av01.0.${fps > 30 ? '09' : '08'}M.08`, hardwareAcceleration: 'prefer-hardware' },
+    { codec: 'vp09.00.10.08', hardwareAcceleration: 'prefer-hardware' },
+  ];
+  return [...h264, ...porHardware, { codec: 'vp8' }, { codec: 'vp09.00.10.08' }].filter(
     (c) => !recusadas.has(familiaDoCodec(c.codec)),
   );
 }
