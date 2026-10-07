@@ -148,11 +148,38 @@ const AUDIO_BITRATE = 96_000;
 const MAX_W = 1920;
 const MAX_H = 1080;
 
+// Teto de quem codifica pela CPU. Medido numa máquina boa: VP8 faz ~100 fps em
+// 1080p e ~180 em 720p — numa máquina fraca, 1080p pela CPU fica abaixo dos
+// 30 fps e a transmissão trava para todo mundo que assiste.
+const CPU_MAX_W = 1280;
+const CPU_MAX_H = 720;
+
 const even = (n) => Math.max(2, n - (n % 2));
 
-function fitWithin(w, h) {
-  const scale = Math.min(1, MAX_W / w, MAX_H / h);
+function fitWithin(w, h, maxW = MAX_W, maxH = MAX_H) {
+  const scale = Math.min(1, maxW / w, maxH / h);
   return { width: even(Math.round(w * scale)), height: even(Math.round(h * scale)) };
+}
+
+/**
+ * Esta config codifica pela CPU?
+ *
+ * VP8 não tem encoder por hardware em máquina comum; VP9 e AV1 só contam como
+ * hardware quando foram pedidos assim. H.264 conta como hardware: é o que ele é
+ * em quase toda máquina, e foi sempre tratado como tal aqui.
+ */
+function pelaCpu(cfg) {
+  const familia = familiaDoCodec(cfg?.codec);
+  if (familia === 'vp8') return true;
+  if (familia === 'vp09' || familia === 'av01') {
+    return cfg.hardwareAcceleration !== 'prefer-hardware';
+  }
+  return false;
+}
+
+/** O tamanho em que esta config vai codificar uma fonte de w×h. */
+function tamanhoPara(cfg, w, h) {
+  return pelaCpu(cfg) ? fitWithin(w, h, CPU_MAX_W, CPU_MAX_H) : fitWithin(w, h);
 }
 
 /**
@@ -686,7 +713,10 @@ export function createBroadcaster({
     for (const candidate of candidatos(width, height, fps, codecsRecusados)) {
       for (const realtime of [true, false]) {
         for (const constante of [true, false]) {
-          const cfg = { ...candidate, width, height, bitrate, framerate: fps };
+          // Cada candidato no tamanho que ele aguenta: o que vai pela CPU desce
+          // para 720p, o que vai pela placa de vídeo fica no tamanho pedido.
+          const tamanho = tamanhoPara(candidate, width, height);
+          const cfg = { ...candidate, ...tamanho, bitrate, framerate: fps };
           if (realtime) cfg.latencyMode = 'realtime';
           if (constante) cfg.bitrateMode = 'constant';
           try {
@@ -886,7 +916,7 @@ export function createBroadcaster({
 
     srcW = sw;
     srcH = sh;
-    const target = fitWithin(sw, sh);
+    const target = tamanhoPara(config, sw, sh);
 
     if (target.width !== config.width || target.height !== config.height) {
       // O nível acompanha o tamanho. Uma janela de 720p que vira 1080p no meio
@@ -1216,7 +1246,10 @@ export function createBroadcaster({
     codecsRecusados.add(familia);
     if (encoder?.state !== 'configured') return;
 
-    const novo = await pickConfig(config.width, config.height);
+    // Pelo tamanho da fonte, e não pelo da config atual: quem vem da placa de
+    // vídeo pode voltar a 1080p, e quem vai para a CPU desce sozinho.
+    const fonte = fitWithin(srcW || config.width, srcH || config.height);
+    const novo = await pickConfig(fonte.width, fonte.height);
     // A transmissão pode ter acabado enquanto o navegador respondia.
     if (!running || encoder?.state !== 'configured') return;
     if (!novo) {
@@ -1236,6 +1269,10 @@ export function createBroadcaster({
       return;
     }
     wantKeyframe = true;
+    // O tamanho pode ter mudado com o codec: o próximo quadro refaz a conta e
+    // o canvas que reduz a imagem, em vez de entregar 1080p a um encoder de 720p.
+    srcW = 0;
+    srcH = 0;
 
     onStatus?.({
       codec: config.codec,

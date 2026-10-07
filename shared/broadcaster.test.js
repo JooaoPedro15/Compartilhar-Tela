@@ -1584,3 +1584,48 @@ describe('codec por hardware antes do codec pela CPU', () => {
     expect(encoder.configuracoes.at(-1).codec).toBe('vp09.00.10.08');
   });
 });
+
+describe('teto de 720p para codec pela CPU', () => {
+  const tela1080 = () => telaSimples({ width: 1920, height: 1080, displaySurface: 'monitor' });
+
+  it('VP8 pela CPU numa tela 1080p sai em 720p, que custa quase metade', async () => {
+    VideoEncoderFalso.isConfigSupported.mockImplementation(async (config) => ({
+      supported: config.codec === 'vp8',
+    }));
+
+    const { encoder } = await noAr({}, tela1080());
+
+    expect(encoder.configuracoes[0]).toMatchObject({ codec: 'vp8', width: 1280, height: 720 });
+  });
+
+  it('codec pela placa de vídeo continua em 1080p', async () => {
+    VideoEncoderFalso.isConfigSupported.mockImplementation(async (config) => ({
+      supported: config.codec.startsWith('avc1.') && Boolean(config.avc),
+    }));
+
+    const { encoder } = await noAr({}, tela1080());
+
+    expect(encoder.configuracoes[0]).toMatchObject({ width: 1920, height: 1080 });
+  });
+
+  it('trocar para a CPU no meio da transmissão reduz e passa a redimensionar os quadros', async () => {
+    VideoEncoderFalso.isConfigSupported.mockImplementation(async (config) => ({
+      supported:
+        (config.codec.startsWith('avc1.') && Boolean(config.avc)) || config.codec === 'vp8',
+    }));
+    const stream = tela1080();
+    const { ws, encoder } = await noAr({}, stream);
+    const track = stream.getVideoTracks()[0];
+    processadorDe(track).empurrar(quadro(1920, 1080));
+    await respirar();
+
+    ws.receber({ type: 'codec-recusado', codec: encoder.configuracoes[0].codec });
+    await respirar();
+    processadorDe(track).empurrar(quadro(1920, 1080));
+    await respirar();
+
+    expect(encoder.configuracoes.at(-1)).toMatchObject({ codec: 'vp8', width: 1280, height: 720 });
+    // O quadro de 1080p passa por um canvas de 720p antes de chegar ao encoder.
+    expect(encoder.codificados.at(-1).frame.displayWidth).toBe(1280);
+  });
+});
